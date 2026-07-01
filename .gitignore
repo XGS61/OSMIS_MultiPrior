@@ -1,0 +1,7 @@
+checkpoints/
+run_logs/
+datasets/*_anatomy/
+**__pycache__/
+__pycache__/
+.idea/
+*.pyc
