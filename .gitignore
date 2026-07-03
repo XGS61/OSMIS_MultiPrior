@@ -2,6 +2,7 @@ checkpoints/
 run_logs/
 imports/
 datasets/*_anatomy/
+datasets/rendered_us_test2_multiprior/
 **__pycache__/
 __pycache__/
 .idea/

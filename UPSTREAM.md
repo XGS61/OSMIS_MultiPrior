@@ -5,9 +5,10 @@
 - Paper: *One-Shot Synthesis of Images and Segmentation Masks*, WACV 2023
 - License: AGPL-3.0
 
-The upstream `LICENSE`, `3rd-party-licenses.txt`, `README.md`, and
-`environment.yml` are preserved in this directory.
+The upstream `LICENSE`, `3rd-party-licenses.txt`, and `environment.yml` are
+preserved in this directory. The README documents this derived implementation.
 
-This derived repository adds anatomy-constrained pseudo-pairs, mask-conditioned
-SPADE generator blocks, conditional discrimination, and structure/texture
-consistency losses. Details are documented in `README.md`.
+This derived repository adds mask-only anatomy priors, selective SPADE,
+SEAN-inspired regional texture modulation, RGB-only low-level discrimination,
+and distributional texture/anatomy losses. It intentionally does not train on
+warped pseudo-images. Details are documented in `README.md`.

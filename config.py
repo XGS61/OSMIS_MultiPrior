@@ -53,14 +53,20 @@ def get_arguments():
     parser.add_argument('--no_DR', action="store_true", help='deactivate Diversity Regularization?')
     parser.add_argument('--prob_augm', type=float, help='probability of data augmentation', default=0.3)
     parser.add_argument('--lambda_DR', type=float, help='lambda for DR', default=0.15)
-    parser.add_argument('--lambda_seg', type=float, default=10.0,
-                        help='target-mask consistency loss weight')
-    parser.add_argument('--lambda_boundary', type=float, default=2.0,
-                        help='target-mask boundary consistency loss weight')
-    parser.add_argument('--lambda_lowfreq', type=float, default=2.0,
-                        help='low-frequency anatomy reconstruction loss weight')
     parser.add_argument('--lambda_texture', type=float, default=1.0,
-                        help='region-wise texture statistics loss weight')
+                        help='region-wise distributional texture loss weight')
+    parser.add_argument('--lambda_frequency', type=float, default=0.25,
+                        help='ultrasound spectrum distribution loss weight')
+    parser.add_argument('--lambda_alignment', type=float, default=2.0,
+                        help='image-mask boundary contrast/gradient loss weight')
+    parser.add_argument('--lambda_same_mask_div', type=float, default=0.2,
+                        help='same-mask, different-latent diversity weight')
+    parser.add_argument('--diversity_margin', type=float, default=0.08,
+                        help='minimum mean image difference for same-mask samples')
+    parser.add_argument('--lambda_anchor', type=float, default=0.5,
+                        help='single fixed-latent reconstruction anchor weight')
+    parser.add_argument('--mask_prior_dir', type=str, default=None,
+                        help='directory containing mask-only prior PNG files')
     parser.add_argument('--prob_FA_con', type=float, help='probability of content FA', default=0.4)
     parser.add_argument('--prob_FA_lay', type=float, help='probability of layout FA', default=0.4)
     parser.add_argument('--no_EMA', action="store_true", help='deactivate exponential moving average of G weights?')
@@ -72,6 +78,8 @@ def get_arguments():
     parser.add_argument('--norm_D', help='which norm to use in discriminator (None|batch|instance)', default="none")
     parser.add_argument('--ch_G', type=float, help='channel multiplier for G blocks', default=32)
     parser.add_argument('--ch_D', type=float, help='channel multiplier for D blocks', default=32)
+    parser.add_argument('--style_dim', type=int, default=32,
+                        help='dimension of regional SEAN-style texture codes')
     parser.add_argument('--num_blocks_d', type=int, help='Discriminator blocks number. 0 -> use recommended default', default=0)
     parser.add_argument('--num_blocks_d0', type=int, help='Num of D_low-level blocks. 0 -> use recommended default', default=0)
 

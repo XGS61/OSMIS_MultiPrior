@@ -1,120 +1,108 @@
-# OSMIS Improved: anatomy-guided one-shot pelvic-floor ultrasound synthesis
+# OSMIS-MultiPrior
 
-This repository preserves the OSMIS backbone while changing the generation
-direction from unconditional joint image-mask synthesis to target-mask
-conditioned image synthesis.
+One-shot generation for a rendered 3D pelvic-floor ultrasound C-plane image.
+The repository trains on **exactly one real image/mask pair** and uses
+anatomy-bounded masks only as generator conditions.
 
-## What changed
+This is deliberately different from rebuilding a dataset of warped images:
 
-- The original OSMIS code remains untouched in the sibling `OSMIS` directory.
-- A conservative C-plane pseudo-pair generator creates smooth image/mask warps.
-- Candidate masks must remain a single, hole-free, pear-shaped levator-hiatus
-  region with bounded area, dimensions, centroid, and SP/PVM endpoint shifts.
-- SPADE blocks inject the target mask at every generator scale.
-- The discriminator receives the target mask together with each image scale.
-- The former generated mask is now an auxiliary prediction used for Dice and
-  boundary consistency. The supplied target mask is the output annotation.
-- Anatomy-breaking layout augmentation (object move/copy/delete and large
-  translations/crops) is disabled.
-- Input images and masks are resized with aspect-preserving padding rather than
-  anisotropic stretching.
-- Low-frequency anatomy and region-wise texture statistics losses are added.
+- `image/` contains exactly one real image.
+- `mask/` contains its one manual levator-hiatus mask.
+- `mask_priors/` contains varied conditions only.
+- no deformed image is presented to the discriminator as real;
+- only one fixed latent and the original mask use an anchor reconstruction loss.
 
-This is a minimum effective version. It does not claim to model population
-anatomy or transitions between rest, contraction, and Valsalva from one case.
+## Model
 
-## Segmentation target
+The generator retains the OSMIS multi-scale backbone:
 
-The binary mask represents the **interior region of the levator hiatus** on the
-oblique axial C-plane at the level of minimal anteroposterior hiatal dimensions.
-The superior limit corresponds to the posterior aspect of the symphysis pubis
-(SP), and the inferior limit to the anterior border of the pubovisceral muscle
-(PVM). In this first version these landmarks are inferred from the superior and
-inferior mask endpoints and used as conservative deformation anchors. They can
-also be supplied manually to `prepare_anatomy_dataset.py` as `--sp x,y` and
-`--pvm x,y`.
+1. low-resolution blocks learn global ultrasound layout from latent noise;
+2. middle blocks use SPADE with an anatomy-bounded levator-hiatus mask;
+3. high-resolution blocks use SEAN-inspired regional style statistics extracted
+   from the single real image, plus latent style perturbation and noise injection.
 
-The implementation follows the constraints described in:
+The discriminator sees RGB images, not a concatenated full mask. The mask is
+used only for OSMIS regional content attention. Training adds regional texture
+distribution, frequency distribution, mask-boundary contrast/gradient,
+same-mask diversity, and a single reconstruction-anchor loss.
 
-- Sindhwani et al., *Semi-automatic outlining of levator hiatus*, UOG 2016.
-- Bonmati et al., *Automatic segmentation method of pelvic floor levator
-  hiatus in ultrasound using a self-normalizing neural network*, JMI 2018.
-- SPADE conditioning: https://github.com/NVlabs/SPADE
-- OSMIS upstream: https://github.com/boschresearch/one-shot-synthesis
+The implementation is based on the open-source OSMIS code and the lightweight
+SPADE version previously validated in `OSMIS_Improved`. See [UPSTREAM.md](UPSTREAM.md)
+and [3rd-party-licenses.txt](3rd-party-licenses.txt).
 
-The two pelvic-floor papers do not provide a public implementation. The smooth
-deformation code therefore uses a transparent SciPy cubic control-grid field,
-following the same conservative B-spline/TPS family of ideas rather than
-claiming to reproduce their BEAS optimizer.
+## Included data
 
-## Environment
+The latest requested pair is included:
+
+- `datasets/rendered_us_test2_source/image/00000.jpg`
+- `datasets/rendered_us_test2_source/mask/00000.png`
+
+The preparation script crops the top 20 acquisition-marker pixels from both
+files, validates alignment, saves one real pair, and builds 64 mask-only priors.
+
+## RTX 5090: one-command training
+
+First create the environment once:
 
 ```bash
-conda create -n osmis_improved python=3.10 -y
-conda activate osmis_improved
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements-modern.txt
+bash setup_5090.sh
+conda activate osmis_multiprior_5090
 ```
 
-For a different CUDA/PyTorch combination, install the matching official
-PyTorch wheel before the remaining requirements.
-
-## One-command training
-
-The repository includes the current example pair under
-`datasets/rendered_us_3d_1/`.
+Then train:
 
 ```bash
-bash train_improved.sh
+bash run_5090.sh
 ```
 
-Background training with one line:
+Defaults are batch size 16, 100,000 iterations, and a checkpoint/monitor image
+every 1,000 iterations. Override without editing files, for example:
 
 ```bash
-nohup bash train_improved.sh > train_stdout.log 2> train_stderr.log & echo $! > process_id.txt
+NUM_EPOCHS=5000 BATCH_SIZE=8 EXP_NAME=smoke_test2 bash run_5090.sh
 ```
 
-Monitor it with:
+Despite the inherited option name, `num_epochs` means optimizer iterations.
+Training output is written to `run_logs/<EXP_NAME>/train.log`; weights and
+monitor grids are under `checkpoints/<EXP_NAME>/`.
 
-```bash
-tail -f run_logs/rendered_us_atg_osmis_v1/train.log
-```
+Each monitor grid contains:
 
-The default run uses 32 validated pseudo-pairs, batch size 8, 150,000
-iterations, and saves checkpoints and previews every 1,000 iterations.
-
-Override settings without editing the script:
-
-```bash
-NUM_EPOCHS=10000 BATCH_SIZE=8 NUM_VARIANTS=32 bash train_improved.sh my_test
-```
-
-Use another image/mask pair:
-
-```bash
-IMAGE_PATH=/path/to/image.png MASK_PATH=/path/to/mask.png bash train_improved.sh my_case
-```
+- first 8 images: the same mask with different latent codes;
+- last 8 images: different masks with the same latent code.
 
 ## Generate
 
-```bash
-bash generate_improved.sh rendered_us_atg_osmis_v1 150000 50
-```
-
-Outputs are written to:
-
-```text
-checkpoints/<experiment>/evaluation/<epoch>/
-```
-
-Each sample includes the generated image, supplied target mask, auxiliary
-predicted mask, and raw label maps.
-
-## Quick implementation check
+The latest checkpoint is selected automatically:
 
 ```bash
-bash run_smoke_test.sh
+bash generate_5090.sh
 ```
 
-Two iterations only verify the data and model paths; they are not a meaningful
-training result.
+Or choose an iteration:
+
+```bash
+bash generate_5090.sh 50000
+```
+
+Images and their binary condition masks are saved to
+`checkpoints/test2_multiprior_5090/evaluation/<ITERATION>/`.
+
+## Use another single case
+
+Supply aligned image and binary mask paths:
+
+```bash
+IMAGE_PATH=/path/case.jpg MASK_PATH=/path/case_mask.png \
+DATASET_NAME=my_case EXP_NAME=my_case_run bash run_5090.sh
+```
+
+Change `crop-top` in `run_5090.sh` if the new image has no top marker. A mask is
+required for the current guided model; the script never manufactures real
+training images from it.
+
+## Important limitation
+
+Mask priors express bounded geometric hypotheses around one annotation; they
+are not learned population anatomy. Outputs still require quantitative and
+expert review before use in a segmentation study.
