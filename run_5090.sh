@@ -9,17 +9,19 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 python -u verify_5090.py
 
-EXP_NAME="${EXP_NAME:-test2_online_minimal_5090}"
-DATASET_NAME="${DATASET_NAME:-rendered_us_test2_online}"
+EXP_NAME="${EXP_NAME:-test2_fullsean_hierarchical_5090}"
+DATASET_NAME="${DATASET_NAME:-rendered_us_test2_fullsean}"
 IMAGE_PATH="${IMAGE_PATH:-datasets/rendered_us_test2_source/image/00000.jpg}"
-MASK_PATH="${MASK_PATH:-datasets/rendered_us_test2_source/mask/00000.png}"
+INDEXED_MASK_PATH="${INDEXED_MASK_PATH:-datasets/rendered_us_test2_multilevel_draft/multilevel_mask_indexed.png}"
+CONDITIONS_PATH="${CONDITIONS_PATH:-datasets/rendered_us_test2_multilevel_draft/hierarchical_conditions.npz}"
 NUM_EPOCHS="${NUM_EPOCHS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 
-python -u prepare_online_case.py \
+python -u prepare_hierarchical_case.py \
   --image "${IMAGE_PATH}" \
-  --mask "${MASK_PATH}" \
+  --indexed-mask "${INDEXED_MASK_PATH}" \
+  --conditions "${CONDITIONS_PATH}" \
   --output "datasets/${DATASET_NAME}" \
   --crop-top 20 \
   --overwrite
@@ -38,12 +40,12 @@ python -u train.py \
   --prob_augm 0.35 \
   --prob_FA_con 0.15 \
   --prob_FA_lay 0.0 \
-  --global_noise_dim 32 \
   --texture_noise_dim 32 \
   --lambda_content 0.5 \
   --lambda_layout 0.15 \
   --lambda_structure 2.0 \
-  --lambda_latent 1.0 \
+  --lambda_diversity 0.25 \
+  --diversity_cap 0.20 \
   --lambda_anchor 0.5 \
   --anchor_decay_start 5000 \
   --anchor_decay_end 20000 \

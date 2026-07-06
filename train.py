@@ -19,7 +19,11 @@ diff_augment = diff_augm.augment_pipe(opt)
 anatomy_sampler = OnlineAnatomySampler(
     max_displacement_frac=opt.anatomy_max_displacement
 )
-print("Using fresh online anatomy conditions; no fixed mask bank is loaded.")
+num_regions = model_config["num_mask_channels"]
+print(
+    "Using fresh hierarchical anatomy conditions; no fixed mask bank or "
+    "pseudo-real image set is loaded."
+)
 
 
 def clone_batch(data):
@@ -31,44 +35,88 @@ def clone_batch(data):
     }
 
 
-def sample_latents(count):
-    z_global = utils.sample_noise(opt.global_noise_dim, count).to(opt.device)
-    z_texture = utils.sample_noise(opt.texture_noise_dim, count).to(opt.device)
-    return z_global, z_texture
+def sample_texture(count):
+    return torch.randn(
+        count,
+        num_regions,
+        opt.texture_noise_dim,
+        device=opt.device,
+    )
+
+
+def mean_pairwise_l1(images):
+    if images.shape[0] < 2:
+        return images.new_tensor(0.0)
+    distances = []
+    for left in range(images.shape[0]):
+        for right in range(left + 1, images.shape[0]):
+            distances.append((images[left] - images[right]).abs().mean())
+    return torch.stack(distances).mean()
 
 
 for epoch, batch in enumerate(dataloader, start=opt.continue_epoch):
     batch = utils.preprocess_real(batch, netD.num_blocks_ll, opt.device)
     style_images = batch["images"][-1]
     style_masks = batch["masks"]
+    base_conditions = batch["conditions"]
     batch_size = style_images.shape[0]
     logits, losses = {}, {}
 
     # ---------------- Generator update ----------------
     netG.zero_grad()
-    target_masks = anatomy_sampler.sample(style_masks, count=batch_size)
-    z_global, z_texture = sample_latents(batch_size)
+    sampled = anatomy_sampler.sample(
+        base_conditions, style_masks, count=batch_size
+    )
+    style_codes = netG.encode_style(
+        style_images[:1],
+        style_masks[:1],
+        output_count=batch_size,
+        randomize_patches=True,
+    )
+    z_texture_a = sample_texture(batch_size)
+    z_texture_b = sample_texture(batch_size)
     out_G = netG.generate(
-        z_global,
-        z_texture,
-        masks=target_masks,
-        style_images=style_images,
-        style_masks=style_masks,
+        z_texture_a,
+        conditions=sampled["conditions"],
+        masks=sampled["masks"],
+        style_codes=style_codes,
+    )
+    out_G_pair = netG.generate(
+        z_texture_b,
+        conditions=sampled["conditions"],
+        masks=sampled["masks"],
+        style_codes=style_codes,
+    )
+    anchor_style = netG.encode_style(
+        style_images[:1],
+        style_masks[:1],
+        output_count=1,
+        randomize_patches=False,
     )
     anchor = netG.generate(
         torch.zeros(
-            1, opt.global_noise_dim, 1, 1, device=opt.device
+            1,
+            num_regions,
+            opt.texture_noise_dim,
+            device=opt.device,
         ),
-        torch.zeros(
-            1, opt.texture_noise_dim, 1, 1, device=opt.device
-        ),
+        conditions=base_conditions[:1],
         masks=style_masks[:1],
-        style_images=style_images[:1],
-        style_masks=style_masks[:1],
-        randomize_noise=False,
+        style_codes=anchor_style,
     )
     losses["G"] = losses_module.guided_generator_losses(
         out_G, anchor, batch, opt, epoch
+    )
+    losses["G"]["texture_diversity"] = (
+        losses_module.texture_diversity_loss(
+            out_G,
+            out_G_pair,
+            sampled["masks"],
+            z_texture_a,
+            z_texture_b,
+            opt.lambda_diversity,
+            opt.diversity_cap,
+        )
     )
     out_G_augmented = diff_augment(out_G)
     logits["G"] = netD.discriminate(
@@ -79,13 +127,10 @@ for epoch, batch in enumerate(dataloader, start=opt.continue_epoch):
             logits["G"], out_G_augmented, real=True, forD=False, epoch=epoch
         )
     )
-    losses["G"]["latent"] = losses_module.latent_reconstruction_loss(
-        logits["G"]["latent"], z_texture, opt.lambda_latent
-    )
     sum(losses["G"].values()).backward()
     optimizerG.step()
 
-    # ---------------- Discriminator + latent head update ----------------
+    # ---------------- Discriminator update ----------------
     netD.zero_grad()
     batch_augmented = diff_augment(clone_batch(batch))
     logits["Dreal"] = netD.discriminate(
@@ -100,15 +145,21 @@ for epoch, batch in enumerate(dataloader, start=opt.continue_epoch):
     )
     sum(losses["Dreal"].values()).backward()
 
-    target_masks = anatomy_sampler.sample(style_masks, count=batch_size)
-    z_global_d, z_texture_d = sample_latents(batch_size)
+    sampled_d = anatomy_sampler.sample(
+        base_conditions, style_masks, count=batch_size
+    )
     with torch.no_grad():
+        style_codes_d = netG.encode_style(
+            style_images[:1],
+            style_masks[:1],
+            output_count=batch_size,
+            randomize_patches=True,
+        )
         out_G_d = netG.generate(
-            z_global_d,
-            z_texture_d,
-            masks=target_masks,
-            style_images=style_images,
-            style_masks=style_masks,
+            sample_texture(batch_size),
+            conditions=sampled_d["conditions"],
+            masks=sampled_d["masks"],
+            style_codes=style_codes_d,
         )
     out_G_d = diff_augment(out_G_d)
     logits["Dfake"] = netD.discriminate(
@@ -120,10 +171,6 @@ for epoch, batch in enumerate(dataloader, start=opt.continue_epoch):
         real=False,
         forD=True,
         epoch=epoch,
-    )
-    # E_z shares D features and is trained only on known synthetic latents.
-    losses["Dfake"]["latent"] = losses_module.latent_reconstruction_loss(
-        logits["Dfake"]["latent"], z_texture_d, opt.lambda_latent
     )
     sum(losses["Dfake"].values()).backward()
     optimizerD.step()
@@ -138,35 +185,38 @@ for epoch, batch in enumerate(dataloader, start=opt.continue_epoch):
         timer(epoch)
         monitor_net = netEMA if not opt.no_EMA else netG
         count = 8
-        repeated_images = style_images[:1].repeat(count, 1, 1, 1)
-        repeated_masks = style_masks[:1].repeat(count, 1, 1, 1)
+        monitor_style = monitor_net.encode_style(
+            style_images[:1],
+            style_masks[:1],
+            output_count=count,
+            randomize_patches=False,
+        )
 
-        # First row group: same anatomy/global code, different texture latents.
-        same_condition = anatomy_sampler.sample(style_masks[:1], count=1).repeat(
+        # First group: identical anatomy and style reference, varied z_texture.
+        one_condition = anatomy_sampler.sample(
+            base_conditions[:1], style_masks[:1], count=1
+        )
+        same_conditions = one_condition["conditions"].repeat(
             count, 1, 1, 1
         )
-        fixed_global, _ = sample_latents(1)
-        fixed_global = fixed_global.repeat(count, 1, 1, 1)
-        _, varied_texture = sample_latents(count)
+        same_masks = one_condition["masks"].repeat(count, 1, 1, 1)
         fake_texture = monitor_net.generate(
-            fixed_global,
-            varied_texture,
-            masks=same_condition,
-            style_images=repeated_images,
-            style_masks=repeated_masks,
-            randomize_noise=False,
+            sample_texture(count),
+            conditions=same_conditions,
+            masks=same_masks,
+            style_codes=monitor_style,
         )
 
-        # Second row group: same latents, fresh online anatomy conditions.
-        varied_conditions = anatomy_sampler.sample(style_masks[:1], count=count)
-        fixed_global_2, fixed_texture_2 = sample_latents(1)
+        # Second group: fixed texture, fresh valid hierarchical anatomy.
+        varied = anatomy_sampler.sample(
+            base_conditions[:1], style_masks[:1], count=count
+        )
+        fixed_texture = sample_texture(1).repeat(count, 1, 1)
         fake_anatomy = monitor_net.generate(
-            fixed_global_2.repeat(count, 1, 1, 1),
-            fixed_texture_2.repeat(count, 1, 1, 1),
-            masks=varied_conditions,
-            style_images=repeated_images,
-            style_masks=repeated_masks,
-            randomize_noise=False,
+            fixed_texture,
+            conditions=varied["conditions"],
+            masks=varied["masks"],
+            style_codes=monitor_style,
         )
         monitor = {
             "images": [
@@ -175,9 +225,31 @@ for epoch, batch in enumerate(dataloader, start=opt.continue_epoch):
                     fake_texture["images"], fake_anatomy["images"]
                 )
             ],
-            "masks": torch.cat((same_condition, varied_conditions), dim=0),
+            "masks": torch.cat((same_masks, varied["masks"]), dim=0),
+            "conditions": torch.cat(
+                (same_conditions, varied["conditions"]), dim=0
+            ),
         }
         visualizer.save_batch(monitor, epoch)
+        texture_images = fake_texture["images"][-1]
+        high_texture = texture_images - torch.nn.functional.avg_pool2d(
+            texture_images, 7, stride=1, padding=3
+        )
+        low_texture = torch.nn.functional.avg_pool2d(
+            texture_images, 7, stride=1, padding=3
+        )
+        monitor_message = (
+            f"[monitor {epoch}] texture_high_l1="
+            f"{float(mean_pairwise_l1(high_texture)):.6f}, "
+            f"texture_low_l1={float(mean_pairwise_l1(low_texture)):.6f}, "
+            f"anatomy_image_l1="
+            f"{float(mean_pairwise_l1(fake_anatomy['images'][-1])):.6f}, "
+            f"anatomy_mask_l1="
+            f"{float(mean_pairwise_l1(varied['masks'])):.6f}"
+        )
+        print(monitor_message)
+        with open(timer.file_name, "a", encoding="utf-8") as monitor_log:
+            monitor_log.write(monitor_message + "\n")
     if (
         epoch % opt.freq_save_loss == 0 or epoch == opt.num_epochs
     ) and epoch > 0:

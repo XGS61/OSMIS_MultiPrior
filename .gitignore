@@ -4,6 +4,7 @@ imports/
 datasets/*_anatomy/
 datasets/rendered_us_test2_multiprior/
 datasets/rendered_us_test2_online/
+datasets/rendered_us_test2_fullsean/
 **__pycache__/
 __pycache__/
 .idea/

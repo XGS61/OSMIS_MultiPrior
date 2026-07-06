@@ -156,8 +156,24 @@ def guided_generator_losses(fake, anchor, real, opt, epoch):
     }
 
 
-def latent_reconstruction_loss(prediction, target, weight):
-    return F.smooth_l1_loss(prediction, target.flatten(1)) * weight
+def texture_diversity_loss(fake_a, fake_b, masks, z_a, z_b, weight, cap):
+    """Make region texture latents visible without rewarding anatomy changes."""
+    image_a = fake_a["images"][-1]
+    image_b = fake_b["images"][-1]
+    high_a = image_a - F.avg_pool2d(image_a, 7, stride=1, padding=3)
+    high_b = image_b - F.avg_pool2d(image_b, 7, stride=1, padding=3)
+    difference = (high_a - high_b).abs().mean(dim=1, keepdim=True)
+
+    region_masks = masks[:, 1:]
+    area = region_masks.sum((2, 3)).clamp_min(1.0)
+    image_distance = (
+        difference * region_masks
+    ).sum((2, 3)) / area
+    latent_distance = (z_a[:, 1:] - z_b[:, 1:]).abs().mean(dim=2)
+    ratio = image_distance / latent_distance.clamp_min(1e-4)
+    valid = (area >= 16).to(ratio.dtype)
+    score = (torch.clamp(ratio, max=cap) * valid).sum() / valid.sum().clamp_min(1)
+    return -score * weight
 
 
 def wgan_loss(output, real, forD):

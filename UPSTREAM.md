@@ -8,8 +8,10 @@
 The upstream `LICENSE`, `3rd-party-licenses.txt`, and `environment.yml` are
 preserved in this directory. The README documents this derived implementation.
 
-This derived repository adds online continuous anatomy-condition sampling,
-selective SPADE, SEAN-inspired regional texture modulation, split global and
-texture latents, and a discriminator latent-regression head. It intentionally
-does not train on warped pseudo-images or a fixed offline mask bank. Details
-are documented in `README.md`.
+This derived repository keeps one OSMIS generator and discriminator while
+adding topology-aware hierarchical online conditions, full SEAN-style
+mask/style modulation in every OSMIS generator block, regional real-patch style
+encoding, and region-specific texture latents. The SEAN design was implemented
+for this repository with the CVPR 2020 paper and the public reference at
+https://github.com/ZPdesu/SEAN as architectural references. It intentionally
+does not train on warped pseudo-images or a fixed offline mask bank.
