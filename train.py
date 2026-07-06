@@ -1,108 +1,134 @@
-import config
-from core import dataloading, models, utils, losses as losses_module, tracking
-from core.mask_prior import MaskPriorBank
-from core.differentiable_augmentation import diff_augm
 import torch
 
+import config
+from core import dataloading, losses as losses_module, models, tracking, utils
+from core.differentiable_augmentation import diff_augm
+from core.online_anatomy import OnlineAnatomySampler
 
-# --- read options --- #
+
 opt = config.read_arguments(train=True)
-
-# --- create dataloader and recommended model config --- #
 dataloader, model_config = dataloading.prepare_dataloading(opt)
-
-# --- create models, losses, and optimizers ---#
 netG, netD, netEMA = models.create_models(opt, model_config)
-losses_computer = losses_module.losses_computer(opt, netD.num_blocks)
+adversarial_losses = losses_module.losses_computer(opt, netD.num_blocks)
 optimizerG, optimizerD = models.create_optimizers(netG, netD, opt)
 
-# --- create utils --- #
 utils.fix_seed(opt.seed)
 timer = utils.timer(opt)
 visualizer = tracking.visualizer(opt)
 diff_augment = diff_augm.augment_pipe(opt)
-mask_prior_dir = opt.mask_prior_dir or (
-    f"{opt.dataroot}/{opt.dataset_name}/mask_priors"
+anatomy_sampler = OnlineAnatomySampler(
+    max_displacement_frac=opt.anatomy_max_displacement
 )
-mask_bank = MaskPriorBank(mask_prior_dir, model_config["image resolution"], opt.device)
-print(f"Loaded {len(mask_bank)} mask-only anatomy priors from {mask_prior_dir}")
+print("Using fresh online anatomy conditions; no fixed mask bank is loaded.")
 
 
 def clone_batch(data):
     return {
-        key: [value.clone() for value in item] if isinstance(item, list) else item.clone()
+        key: [value.clone() for value in item]
+        if isinstance(item, list)
+        else item.clone()
         for key, item in data.items()
     }
 
-# --- training loop --- #
+
+def sample_latents(count):
+    z_global = utils.sample_noise(opt.global_noise_dim, count).to(opt.device)
+    z_texture = utils.sample_noise(opt.texture_noise_dim, count).to(opt.device)
+    return z_global, z_texture
+
+
 for epoch, batch in enumerate(dataloader, start=opt.continue_epoch):
     batch = utils.preprocess_real(batch, netD.num_blocks_ll, opt.device)
     style_images = batch["images"][-1]
     style_masks = batch["masks"]
-    logits, losses = dict(), dict()
+    batch_size = style_images.shape[0]
+    logits, losses = {}, {}
 
-    # --- generator update --- #
+    # ---------------- Generator update ----------------
     netG.zero_grad()
-    target_masks = mask_bank.sample(style_images.shape[0])
-    z = utils.sample_noise(opt.noise_dim, style_images.shape[0]).to(opt.device)
-    z_second = utils.sample_noise(opt.noise_dim, style_images.shape[0]).to(opt.device)
+    target_masks = anatomy_sampler.sample(style_masks, count=batch_size)
+    z_global, z_texture = sample_latents(batch_size)
     out_G = netG.generate(
-        z,
-        masks=target_masks,
-        style_images=style_images,
-        style_masks=style_masks,
-        get_feat=not opt.no_DR,
-    )
-    out_G_second = netG.generate(
-        z_second,
+        z_global,
+        z_texture,
         masks=target_masks,
         style_images=style_images,
         style_masks=style_masks,
     )
     anchor = netG.generate(
-        torch.zeros(1, opt.noise_dim, 1, 1, device=opt.device),
+        torch.zeros(
+            1, opt.global_noise_dim, 1, 1, device=opt.device
+        ),
+        torch.zeros(
+            1, opt.texture_noise_dim, 1, 1, device=opt.device
+        ),
         masks=style_masks[:1],
         style_images=style_images[:1],
         style_masks=style_masks[:1],
         randomize_noise=False,
     )
     losses["G"] = losses_module.guided_generator_losses(
-        out_G, out_G_second, anchor, batch, opt
+        out_G, anchor, batch, opt, epoch
     )
-    out_G = diff_augment(out_G)
-    logits["G"] = netD.discriminate(out_G, for_real=False, epoch=epoch)
-    losses["G"].update(losses_computer(logits["G"], out_G, real=True, forD=False))
-    loss = sum(losses["G"].values())
-    loss.backward()
+    out_G_augmented = diff_augment(out_G)
+    logits["G"] = netD.discriminate(
+        out_G_augmented, for_real=False, epoch=epoch
+    )
+    losses["G"].update(
+        adversarial_losses(
+            logits["G"], out_G_augmented, real=True, forD=False, epoch=epoch
+        )
+    )
+    losses["G"]["latent"] = losses_module.latent_reconstruction_loss(
+        logits["G"]["latent"], z_texture, opt.lambda_latent
+    )
+    sum(losses["G"].values()).backward()
     optimizerG.step()
 
-    # --- discriminator update --- #
+    # ---------------- Discriminator + latent head update ----------------
     netD.zero_grad()
     batch_augmented = diff_augment(clone_batch(batch))
-    logits["Dreal"] = netD.discriminate(batch_augmented, for_real=True, epoch=epoch)
-    losses["Dreal"] = losses_computer(
-        logits["Dreal"], batch_augmented, real=True, forD=True
+    logits["Dreal"] = netD.discriminate(
+        batch_augmented, for_real=True, epoch=epoch
     )
-    loss = sum(losses["Dreal"].values())
-    loss.backward()
+    losses["Dreal"] = adversarial_losses(
+        logits["Dreal"],
+        batch_augmented,
+        real=True,
+        forD=True,
+        epoch=epoch,
+    )
+    sum(losses["Dreal"].values()).backward()
 
-    z = utils.sample_noise(opt.noise_dim, style_images.shape[0]).to(opt.device)
-    target_masks = mask_bank.sample(style_images.shape[0])
+    target_masks = anatomy_sampler.sample(style_masks, count=batch_size)
+    z_global_d, z_texture_d = sample_latents(batch_size)
     with torch.no_grad():
-        out_G = netG.generate(
-            z,
+        out_G_d = netG.generate(
+            z_global_d,
+            z_texture_d,
             masks=target_masks,
             style_images=style_images,
             style_masks=style_masks,
         )
-    out_G = diff_augment(out_G)
-    logits["Dfake"] = netD.discriminate(out_G, for_real=False, epoch=epoch)
-    losses["Dfake"] = losses_computer(logits["Dfake"], out_G, real=False, forD=True)
-    loss = sum(losses["Dfake"].values())
-    loss.backward()
+    out_G_d = diff_augment(out_G_d)
+    logits["Dfake"] = netD.discriminate(
+        out_G_d, for_real=False, epoch=epoch
+    )
+    losses["Dfake"] = adversarial_losses(
+        logits["Dfake"],
+        out_G_d,
+        real=False,
+        forD=True,
+        epoch=epoch,
+    )
+    # E_z shares D features and is trained only on known synthetic latents.
+    losses["Dfake"]["latent"] = losses_module.latent_reconstruction_loss(
+        logits["Dfake"]["latent"], z_texture_d, opt.lambda_latent
+    )
+    sum(losses["Dfake"].values()).backward()
     optimizerD.step()
 
-    # --- stats tracking --- #
+    # ---------------- Tracking ----------------
     visualizer.track_losses_logits(logits, losses)
     if not opt.no_EMA:
         netEMA = utils.update_EMA(netEMA, netG, opt.EMA_decay)
@@ -111,38 +137,52 @@ for epoch, batch in enumerate(dataloader, start=opt.continue_epoch):
     if epoch % opt.freq_print == 0 or epoch == opt.num_epochs:
         timer(epoch)
         monitor_net = netEMA if not opt.no_EMA else netG
-        same_masks = mask_bank.first(8)
-        varied_masks = mask_bank.cycle(8, offset=epoch)
-        z_random = utils.sample_noise(opt.noise_dim, 8).to(opt.device)
-        z_fixed = utils.sample_noise(opt.noise_dim, 1).to(opt.device).repeat(8, 1, 1, 1)
-        repeated_style_images = style_images[:1].repeat(8, 1, 1, 1)
-        repeated_style_masks = style_masks[:1].repeat(8, 1, 1, 1)
-        fake_same = monitor_net.generate(
-            z_random,
-            masks=same_masks,
-            style_images=repeated_style_images,
-            style_masks=repeated_style_masks,
+        count = 8
+        repeated_images = style_images[:1].repeat(count, 1, 1, 1)
+        repeated_masks = style_masks[:1].repeat(count, 1, 1, 1)
+
+        # First row group: same anatomy/global code, different texture latents.
+        same_condition = anatomy_sampler.sample(style_masks[:1], count=1).repeat(
+            count, 1, 1, 1
         )
-        fake_varied = monitor_net.generate(
-            z_fixed,
-            masks=varied_masks,
-            style_images=repeated_style_images,
-            style_masks=repeated_style_masks,
+        fixed_global, _ = sample_latents(1)
+        fixed_global = fixed_global.repeat(count, 1, 1, 1)
+        _, varied_texture = sample_latents(count)
+        fake_texture = monitor_net.generate(
+            fixed_global,
+            varied_texture,
+            masks=same_condition,
+            style_images=repeated_images,
+            style_masks=repeated_masks,
+            randomize_noise=False,
         )
-        fake = {
+
+        # Second row group: same latents, fresh online anatomy conditions.
+        varied_conditions = anatomy_sampler.sample(style_masks[:1], count=count)
+        fixed_global_2, fixed_texture_2 = sample_latents(1)
+        fake_anatomy = monitor_net.generate(
+            fixed_global_2.repeat(count, 1, 1, 1),
+            fixed_texture_2.repeat(count, 1, 1, 1),
+            masks=varied_conditions,
+            style_images=repeated_images,
+            style_masks=repeated_masks,
+            randomize_noise=False,
+        )
+        monitor = {
             "images": [
                 torch.cat((left, right), dim=0)
-                for left, right in zip(fake_same["images"], fake_varied["images"])
+                for left, right in zip(
+                    fake_texture["images"], fake_anatomy["images"]
+                )
             ],
-            "masks": torch.cat((same_masks, varied_masks), dim=0),
+            "masks": torch.cat((same_condition, varied_conditions), dim=0),
         }
-        visualizer.save_batch(fake, epoch)
-    if (epoch % opt.freq_save_loss == 0 or epoch == opt.num_epochs) and epoch > 0 :
+        visualizer.save_batch(monitor, epoch)
+    if (
+        epoch % opt.freq_save_loss == 0 or epoch == opt.num_epochs
+    ) and epoch > 0:
         visualizer.save_losses_logits(epoch)
-
-    # --- exit if reached the end --- #
     if epoch >= opt.num_epochs:
         break
 
-# --- after training ---#
-print("Succesfully finished")
+print("Successfully finished")

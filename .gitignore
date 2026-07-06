@@ -3,6 +3,7 @@ run_logs/
 imports/
 datasets/*_anatomy/
 datasets/rendered_us_test2_multiprior/
+datasets/rendered_us_test2_online/
 **__pycache__/
 __pycache__/
 .idea/

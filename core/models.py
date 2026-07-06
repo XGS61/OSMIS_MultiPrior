@@ -68,8 +68,13 @@ def prepare_config(opt, recommended_config):
     """
     G_keys_recommended = ['noise_shape', 'num_blocks_g', "no_masks", "num_mask_channels"]
     D_keys_recommended = ['num_blocks_d', 'num_blocks_d0', "no_masks", "num_mask_channels"]
-    G_keys_user = ["ch_G", "norm_G", "noise_dim", "style_dim"]
-    D_keys_user = ["ch_D", "norm_D", "prob_FA_con", "prob_FA_lay", "bernoulli_warmup"]
+    G_keys_user = [
+        "ch_G", "norm_G", "global_noise_dim", "texture_noise_dim", "style_dim"
+    ]
+    D_keys_user = [
+        "ch_D", "norm_D", "prob_FA_con", "prob_FA_lay",
+        "bernoulli_warmup", "texture_noise_dim"
+    ]
 
     config_G = dict((k, recommended_config[k]) for k in G_keys_recommended)
     config_G.update(dict((k, getattr(opt, k)) for k in G_keys_user))
@@ -109,7 +114,8 @@ class Generator(nn.Module):
         super(Generator, self).__init__()
         self.num_blocks = config_G["num_blocks_g"]
         self.noise_shape = config_G["noise_shape"]
-        self.noise_init_dim = config_G["noise_dim"]
+        self.global_noise_dim = config_G["global_noise_dim"]
+        self.texture_noise_dim = config_G["texture_noise_dim"]
         self.norm_name = config_G["norm_G"]
         self.no_masks = config_G["no_masks"]
         self.num_mask_channels = config_G["num_mask_channels"]
@@ -117,7 +123,9 @@ class Generator(nn.Module):
         num_of_channels = get_channels("Generator", config_G["ch_G"])[-self.num_blocks-1:]
 
         self.body, self.rgb_converters = nn.ModuleList([]), nn.ModuleList([])
-        self.first_linear = nn.ConvTranspose2d(self.noise_init_dim, num_of_channels[0], self.noise_shape)
+        self.first_linear = nn.ConvTranspose2d(
+            self.global_noise_dim, num_of_channels[0], self.noise_shape
+        )
         self.style_encoder = RegionStyleEncoder(
             self.num_mask_channels, self.style_dim
         ) if not self.no_masks else None
@@ -138,7 +146,7 @@ class Generator(nn.Module):
                 None if self.no_masks else self.num_mask_channels,
                 condition_mode=condition_mode,
                 style_dim=self.style_dim,
-                noise_dim=self.noise_init_dim,
+                noise_dim=self.texture_noise_dim,
             )
             cur_rgb   = to_rgb(num_of_channels[i+1])
             self.body.append(cur_block)
@@ -147,7 +155,8 @@ class Generator(nn.Module):
 
     def generate(
         self,
-        z,
+        z_global,
+        z_texture,
         masks=None,
         style_images=None,
         style_masks=None,
@@ -164,9 +173,11 @@ class Generator(nn.Module):
         style_codes = None
         if not self.no_masks:
             style_codes = self.style_encoder(style_images, style_masks)
-        x = self.first_linear(z)
+        x = self.first_linear(z_global)
         for i in range(self.num_blocks):
-            x = self.body[i](x, masks, style_codes, z, randomize_noise)
+            x = self.body[
+                i
+            ](x, masks, style_codes, z_texture, randomize_noise)
             im = torch.tanh(self.rgb_converters[i](x))
             ans_images.append(im)
             ans_feat.append(torch.tanh(x))
@@ -246,7 +257,7 @@ class G_block(nn.Module):
 
 
 class SPADE(nn.Module):
-    """Lightweight spatially-adaptive normalization for binary anatomy masks."""
+    """Lightweight spatially-adaptive normalization for semantic anatomy maps."""
 
     def __init__(self, channels, num_mask_channels, hidden=64):
         super().__init__()
@@ -327,6 +338,7 @@ class Discriminator(nn.Module):
         self.prob_FA = {"content": config_D["prob_FA_con"], "layout": config_D["prob_FA_lay"]}
         self.no_masks = config_D["no_masks"]
         self.num_mask_channels = config_D["num_mask_channels"]
+        self.texture_noise_dim = config_D["texture_noise_dim"]
         self.bernoulli_warmup = config_D["bernoulli_warmup"]
         num_of_channels = get_channels("Discriminator", config_D["ch_D"])[:self.num_blocks + 1]
         if not self.no_masks:
@@ -346,6 +358,11 @@ class Discriminator(nn.Module):
             self.body_ll.append(cur_block)
             self.rgb_to_features.append(from_rgb(msg_channels, in_channels=3))
             self.final_ll.append(to_decision(num_of_channels[i+1], 1))
+        self.latent_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(num_of_channels[self.num_blocks_ll], self.texture_noise_dim),
+        )
 
         # --- D content --- #
         self.content_FA = Content_FA(self.no_masks, self.prob_FA["content"], self.num_mask_channels)
@@ -415,7 +432,13 @@ class Discriminator(nn.Module):
             y_lay = self.body_layout[k](y_lay)
             output_layout.append(self.final_layout[k](y_lay))
 
-        return {"low-level": output_ll, "content": output_content, "layout": output_layout}
+        latent_prediction = self.latent_head(y)
+        return {
+            "low-level": output_ll,
+            "content": output_content,
+            "layout": output_layout,
+            "latent": latent_prediction,
+        }
 
 
 class D_block(nn.Module):

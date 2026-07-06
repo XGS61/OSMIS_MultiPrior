@@ -65,6 +65,8 @@ class losses_saver():
     def collect_logits(self, logits):
         ans, cou = 0, 0
         for item in logits:
+            if item == "latent":
+                continue
             for logit in logits[item]:
                 ans += logit.detach().cpu().numpy().mean()
                 cou += 1

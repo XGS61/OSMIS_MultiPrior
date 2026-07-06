@@ -43,30 +43,35 @@ def get_arguments():
 
     # training:
     parser.add_argument('--batch_size', type=int, help='batch_size', default=5)
-    parser.add_argument('--noise_dim', type=int, help='dimension of noise vector', default=64)
+    parser.add_argument('--global_noise_dim', type=int, default=32,
+                        help='global/layout latent dimension')
+    parser.add_argument('--texture_noise_dim', type=int, default=32,
+                        help='regional texture latent dimension')
     parser.add_argument('--lr_g', type=float, default=0.0002, help='generator learning rate')
     parser.add_argument('--lr_d', type=float, default=0.0002, help='discriminator learning rate')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for adam')
     parser.add_argument('--loss_mode', help='which GAN loss (wgan|hinge|bce)', default="bce")
     parser.add_argument('--seed', type=int, help='which randomm seed to use', default=22)
-    parser.add_argument('--no_DR', action="store_true", help='deactivate Diversity Regularization?')
     parser.add_argument('--prob_augm', type=float, help='probability of data augmentation', default=0.3)
-    parser.add_argument('--lambda_DR', type=float, help='lambda for DR', default=0.15)
-    parser.add_argument('--lambda_texture', type=float, default=1.0,
-                        help='region-wise distributional texture loss weight')
-    parser.add_argument('--lambda_frequency', type=float, default=0.25,
-                        help='ultrasound spectrum distribution loss weight')
-    parser.add_argument('--lambda_alignment', type=float, default=2.0,
-                        help='image-mask boundary contrast/gradient loss weight')
-    parser.add_argument('--lambda_same_mask_div', type=float, default=0.2,
-                        help='same-mask, different-latent diversity weight')
-    parser.add_argument('--diversity_margin', type=float, default=0.08,
-                        help='minimum mean image difference for same-mask samples')
+    parser.add_argument('--lambda_content', type=float, default=0.5,
+                        help='OSMIS region-content adversarial weight')
+    parser.add_argument('--lambda_layout', type=float, default=0.15,
+                        help='initial weak OSMIS global-layout adversarial weight')
+    parser.add_argument('--layout_decay_start', type=int, default=5000)
+    parser.add_argument('--layout_decay_end', type=int, default=20000)
+    parser.add_argument('--layout_final_ratio', type=float, default=0.25)
+    parser.add_argument('--lambda_structure', type=float, default=2.0,
+                        help='single image-condition boundary consistency weight')
+    parser.add_argument('--lambda_latent', type=float, default=1.0,
+                        help='texture latent reconstruction weight for G and E_z')
     parser.add_argument('--lambda_anchor', type=float, default=0.5,
                         help='single fixed-latent reconstruction anchor weight')
-    parser.add_argument('--mask_prior_dir', type=str, default=None,
-                        help='directory containing mask-only prior PNG files')
+    parser.add_argument('--anchor_decay_start', type=int, default=5000)
+    parser.add_argument('--anchor_decay_end', type=int, default=20000)
+    parser.add_argument('--anchor_final_ratio', type=float, default=0.10)
+    parser.add_argument('--anatomy_max_displacement', type=float, default=0.025,
+                        help='online smooth mask displacement as image fraction')
     parser.add_argument('--prob_FA_con', type=float, help='probability of content FA', default=0.4)
     parser.add_argument('--prob_FA_lay', type=float, help='probability of layout FA', default=0.4)
     parser.add_argument('--no_EMA', action="store_true", help='deactivate exponential moving average of G weights?')

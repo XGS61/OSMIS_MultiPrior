@@ -1,108 +1,163 @@
-# OSMIS-MultiPrior
+# OSMIS Online Anatomy
 
-One-shot generation for a rendered 3D pelvic-floor ultrasound C-plane image.
-The repository trains on **exactly one real image/mask pair** and uses
-anatomy-bounded masks only as generator conditions.
+One-shot generation for a rendered pelvic-floor ultrasound C-plane image.
+The model uses exactly one real image/annotation pair. It does not construct
+warped pseudo-images and does not use a fixed offline mask bank.
 
-This is deliberately different from rebuilding a dataset of warped images:
+## What changed
 
-- `image/` contains exactly one real image.
-- `mask/` contains its one manual levator-hiatus mask.
-- `mask_priors/` contains varied conditions only.
-- no deformed image is presented to the discriminator as real;
-- only one fixed latent and the original mask use an anchor reconstruction loss.
+- OSMIS remains the only image-generation backbone.
+- Middle generator blocks use SPADE for anatomy conditions.
+- High-resolution blocks use SEAN-inspired regional style modulation.
+- A fresh anatomy condition is sampled online for every training batch and
+  every generated image.
+- Global/layout and regional texture latents are independent.
+- A latent-regression head on shared discriminator features forces the
+  generator to use the texture latent.
+- The training objective is intentionally limited to four families:
+  adversarial, structure consistency, latent reconstruction, and a decaying
+  single reconstruction anchor.
+
+The online sampler is non-neural. It applies bounded affine and smooth elastic
+changes to the annotation, validates area and centroid displacement, and never
+creates a corresponding fake "real" image.
+
+## Annotation requirements
+
+The included example currently has a binary annotation:
+
+```text
+0   background
+255 annotated outer region
+```
+
+This mode runs directly, but it can only control that one annotated region.
+It cannot guarantee independent, clinically correct variation of an unlabelled
+internal hiatus.
+
+For independent internal-structure control, supply one indexed PNG label map:
+
+```text
+0 background
+1 outer/primary annotated region
+2 internal hiatus
+3..K optional additional internal structures
+```
+
+Pixel values must be literal class indices `0, 1, 2, ...`, not display colors.
+The additional labels are generation-only conditions; the downstream
+segmentation target may still be reduced to the desired primary class.
+
+When separate binary outer/inner masks are available, merge them with:
+
+```bash
+python build_multilevel_annotation.py \
+  --outer current_mask.png \
+  --inner internal_hiatus.png \
+  --output indexed_anatomy.png
+```
+
+All classes receive the same smooth global transform. Internal classes receive
+a smaller relative transform and are constrained to remain inside the global
+foreground support.
 
 ## Model
 
-The generator retains the OSMIS multi-scale backbone:
+At 320 x 320, the generator follows:
 
-1. low-resolution blocks learn global ultrasound layout from latent noise;
-2. middle blocks use SPADE with an anatomy-bounded levator-hiatus mask;
-3. high-resolution blocks use SEAN-inspired regional style statistics extracted
-   from the single real image, plus latent style perturbation and noise injection.
+```text
+z_global -> low-resolution OSMIS blocks
+online anatomy condition -> middle SPADE blocks
+single real image + z_texture -> high-resolution SEAN-style blocks
+```
 
-The discriminator sees RGB images, not a concatenated full mask. The mask is
-used only for OSMIS regional content attention. Training adds regional texture
-distribution, frequency distribution, mask-boundary contrast/gradient,
-same-mask diversity, and a single reconstruction-anchor loss.
+The discriminator retains OSMIS low-level, masked-content, and weak layout
+branches. A small latent head regresses `z_texture` from shared downsampled
+features.
 
-The implementation is based on the open-source OSMIS code and the lightweight
-SPADE version previously validated in `OSMIS_Improved`. See [UPSTREAM.md](UPSTREAM.md)
-and [3rd-party-licenses.txt](3rd-party-licenses.txt).
+The generator objective is:
 
-## Included data
+```text
+L_G = L_adversarial
+    + lambda_structure * L_structure
+    + lambda_latent * L_latent
+    + lambda_anchor(t) * L_anchor
+```
 
-The latest requested pair is included:
+The layout and anchor weights decay after warm-up. There are no separate
+texture-statistics, frequency, same-mask pixel-diversity, or offline-mask losses.
 
-- `datasets/rendered_us_test2_source/image/00000.jpg`
-- `datasets/rendered_us_test2_source/mask/00000.png`
+## RTX 5090
 
-The preparation script crops the top 20 acquisition-marker pixels from both
-files, validates alignment, saves one real pair, and builds 64 mask-only priors.
-
-## RTX 5090: one-command training
-
-First create the environment once:
+Create the environment once:
 
 ```bash
 bash setup_5090.sh
 conda activate osmis_multiprior_5090
 ```
 
-Then train:
+Train:
 
 ```bash
 bash run_5090.sh
 ```
 
-Defaults are batch size 16, 100,000 iterations, and a checkpoint/monitor image
-every 1,000 iterations. Override without editing files, for example:
+Defaults:
+
+- source pair: `datasets/rendered_us_test2_source/`
+- experiment: `test2_online_minimal_5090`
+- batch size: 16
+- iterations: 100,000
+- checkpoints and monitor grids: every 1,000 iterations
+
+Override without editing:
 
 ```bash
-NUM_EPOCHS=5000 BATCH_SIZE=8 EXP_NAME=smoke_test2 bash run_5090.sh
+NUM_EPOCHS=5000 BATCH_SIZE=8 EXP_NAME=online_smoke bash run_5090.sh
 ```
 
-Despite the inherited option name, `num_epochs` means optimizer iterations.
-Training output is written to `run_logs/<EXP_NAME>/train.log`; weights and
-monitor grids are under `checkpoints/<EXP_NAME>/`.
-
-Each monitor grid contains:
-
-- first 8 images: the same mask with different latent codes;
-- last 8 images: different masks with the same latent code.
+Training creates a new output name and does not overwrite previous 99k
+MultiPrior checkpoints.
 
 ## Generate
 
-The latest checkpoint is selected automatically:
+Use the latest checkpoint:
 
 ```bash
 bash generate_5090.sh
 ```
 
-Or choose an iteration:
+Or specify an iteration:
 
 ```bash
 bash generate_5090.sh 50000
 ```
 
-Images and their binary condition masks are saved to
-`checkpoints/test2_multiprior_5090/evaluation/<ITERATION>/`.
+Every result receives a newly sampled online condition and fresh global/texture
+latents. The condition mask saved beside the image is the actual condition used
+for that sample.
 
-## Use another single case
+## Monitor layout
 
-Supply aligned image and binary mask paths:
+Each training monitor contains 16 images:
 
-```bash
-IMAGE_PATH=/path/case.jpg MASK_PATH=/path/case_mask.png \
-DATASET_NAME=my_case EXP_NAME=my_case_run bash run_5090.sh
-```
+- first 8: identical anatomy and global latent, different texture latents;
+- last 8: identical latents, eight freshly sampled anatomy conditions.
 
-Change `crop-top` in `run_5090.sh` if the new image has no top marker. A mask is
-required for the current guided model; the script never manufactures real
-training images from it.
+This makes latent collapse and condition collapse visible during training.
 
-## Important limitation
+## Limitation
 
-Mask priors express bounded geometric hypotheses around one annotation; they
-are not learned population anatomy. Outputs still require quantitative and
-expert review before use in a segmentation study.
+One case cannot identify a population distribution of unlabelled anatomy.
+Online sampling provides continuous variation within explicit constraints; it
+does not manufacture unknown clinical knowledge. Internal anatomy should not be
+claimed as controlled until the corresponding auxiliary label or landmark has
+been supplied and independently evaluated.
+
+## Provenance
+
+The code derives from the open-source OSMIS implementation:
+https://github.com/boschresearch/one-shot-synthesis
+
+See [UPSTREAM.md](UPSTREAM.md), [LICENSE](LICENSE), and
+[3rd-party-licenses.txt](3rd-party-licenses.txt).

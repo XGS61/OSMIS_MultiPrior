@@ -8,7 +8,8 @@
 The upstream `LICENSE`, `3rd-party-licenses.txt`, and `environment.yml` are
 preserved in this directory. The README documents this derived implementation.
 
-This derived repository adds mask-only anatomy priors, selective SPADE,
-SEAN-inspired regional texture modulation, RGB-only low-level discrimination,
-and distributional texture/anatomy losses. It intentionally does not train on
-warped pseudo-images. Details are documented in `README.md`.
+This derived repository adds online continuous anatomy-condition sampling,
+selective SPADE, SEAN-inspired regional texture modulation, split global and
+texture latents, and a discriminator latent-regression head. It intentionally
+does not train on warped pseudo-images or a fixed offline mask bank. Details
+are documented in `README.md`.

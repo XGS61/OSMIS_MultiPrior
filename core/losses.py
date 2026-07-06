@@ -9,11 +9,12 @@ class losses_computer():
         """
         self.loss_function = self.get_loss_function(opt.loss_mode)
         self.no_masks = opt.no_masks
-        self.no_DR = opt.no_DR
-        self.lambdas = {"content": 0.5 / num_blocks,
-                        "layout": 0.5 / num_blocks,
-                        "low-level": 1.0 / num_blocks,
-                        "DR": opt.lambda_DR}
+        self.num_blocks = num_blocks
+        self.lambda_content = opt.lambda_content
+        self.lambda_layout = opt.lambda_layout
+        self.layout_decay_start = opt.layout_decay_start
+        self.layout_decay_end = opt.layout_decay_end
+        self.layout_final_ratio = opt.layout_final_ratio
 
     def get_loss_function(self, loss_mode):
         if loss_mode == "wgan":
@@ -42,34 +43,22 @@ class losses_computer():
         loss = F.cross_entropy(out_d, ground_t.long().to(out_d.device), weight=weights.to(out_d.device))
         return loss
 
-    def diversity_regularization(self, fake):
-        """
-        The diversity regularization applied in the feature space of the generator
-        """
-        loss = torch.nn.L1Loss()
-        ans = fake[0].new_tensor(0.0)
-        for i in range(len(fake)):
-            for k in range(fake[i].shape[0]):
-                for m in range(k + 1, fake[i].shape[0]):
-                    ans += -loss(fake[i][k], fake[i][m])
-        pair_count = sum(
-            item.shape[0] * (item.shape[0] - 1) // 2 for item in fake
-        )
-        return ans / max(pair_count, 1)
+    def layout_weight(self, epoch):
+        if epoch <= self.layout_decay_start:
+            ratio = 1.0
+        elif epoch >= self.layout_decay_end:
+            ratio = self.layout_final_ratio
+        else:
+            progress = (epoch - self.layout_decay_start) / max(
+                self.layout_decay_end - self.layout_decay_start, 1
+            )
+            ratio = 1.0 - progress * (1.0 - self.layout_final_ratio)
+        return self.lambda_layout * ratio / self.num_blocks
 
-    def balance_losses(self, losses):
-        """
-        Multiply each loss part with its lambda
-        """
-        for item in losses:
-            if item in self.lambdas.keys():
-                losses[item] = losses[item] * self.lambdas[item]
-        return losses
-
-    def __call__(self, out_d, data, real, forD):
+    def __call__(self, out_d, data, real, forD, epoch=0):
         losses = {}
         # --- adversarial loss ---#
-        for item in out_d:
+        for item in ("low-level", "content", "layout"):
             for i in range(len(out_d[item])):
                 if item == "content" and not self.no_masks:
                     losses[item] = losses.get(item, 0) + self.content_segm_loss(
@@ -80,10 +69,11 @@ class losses_computer():
                         out_d[item][i], real, forD
                     )
 
-        # --- diversity regularization ---#
-        if not forD and not self.no_DR:
-            losses["DR"] = self.diversity_regularization(data["features"])
-        losses = self.balance_losses(losses)
+        losses["low-level"] = losses["low-level"] / self.num_blocks
+        losses["content"] = (
+            losses["content"] * self.lambda_content / self.num_blocks
+        )
+        losses["layout"] = losses["layout"] * self.layout_weight(epoch)
         return losses
 
 
@@ -95,49 +85,6 @@ def _masked_stats(image, mask, eps=1e-6):
     return mean, torch.sqrt(variance + eps)
 
 
-def _texture_statistics_loss(fake, real, fake_masks, real_masks):
-    total = fake.new_tensor(0.0)
-    for channel in range(fake_masks.shape[1]):
-        fake_region = fake_masks[:, channel:channel + 1]
-        real_region = real_masks[:, channel:channel + 1]
-        fake_mean, fake_std = _masked_stats(fake, fake_region)
-        real_mean, real_std = _masked_stats(real, real_region)
-        total = total + F.l1_loss(fake_mean, real_mean) + F.l1_loss(fake_std, real_std)
-
-    fake_gray = fake.mean(dim=1, keepdim=True)
-    real_gray = real.mean(dim=1, keepdim=True)
-    fake_grad = torch.abs(fake_gray[:, :, :, 1:] - fake_gray[:, :, :, :-1])
-    real_grad = torch.abs(real_gray[:, :, :, 1:] - real_gray[:, :, :, :-1])
-    fake_grad_mask = fake_masks[:, 1:2, :, 1:]
-    real_grad_mask = real_masks[:, 1:2, :, 1:]
-    fake_g_mean, fake_g_std = _masked_stats(fake_grad, fake_grad_mask)
-    real_g_mean, real_g_std = _masked_stats(real_grad, real_grad_mask)
-    return total + F.l1_loss(fake_g_mean, real_g_mean) + F.l1_loss(fake_g_std, real_g_std)
-
-
-def _frequency_distribution_loss(fake, real):
-    """Match multi-band frequency energy without forcing pixel correspondence."""
-    fake_gray = F.interpolate(fake.mean(1, keepdim=True), size=(64, 64), mode="area")
-    real_gray = F.interpolate(real.mean(1, keepdim=True), size=(64, 64), mode="area")
-    total = fake.new_tensor(0.0)
-    for kernel in (3, 7, 15):
-        fake_low = F.avg_pool2d(
-            fake_gray, kernel, stride=1, padding=kernel // 2
-        )
-        real_low = F.avg_pool2d(
-            real_gray, kernel, stride=1, padding=kernel // 2
-        )
-        fake_band = fake_gray - fake_low
-        real_band = real_gray - real_low
-        total = total + F.l1_loss(
-            fake_band.abs().mean((2, 3)), real_band.abs().mean((2, 3))
-        )
-        total = total + F.l1_loss(
-            fake_band.std((2, 3)), real_band.std((2, 3))
-        )
-    return total / 3.0
-
-
 def _rings(foreground, width=5):
     dilated = F.max_pool2d(foreground, width * 2 + 1, stride=1, padding=width)
     eroded = -F.max_pool2d(-foreground, width * 2 + 1, stride=1, padding=width)
@@ -147,8 +94,7 @@ def _rings(foreground, width=5):
     return inner, outer, boundary
 
 
-def _boundary_signature(image, masks):
-    foreground = masks[:, 1:2]
+def _boundary_signature(image, foreground):
     inner, outer, boundary = _rings(foreground)
     gray = image.mean(1, keepdim=True)
     inner_mean, _ = _masked_stats(gray, inner)
@@ -159,47 +105,59 @@ def _boundary_signature(image, masks):
     return outer_mean - inner_mean, gradient_mean, gradient_std
 
 
-def _alignment_loss(fake, real, fake_masks, real_masks):
-    fake_signature = _boundary_signature(fake, fake_masks)
-    real_signature = _boundary_signature(real, real_masks)
-    return sum(F.l1_loss(a, b) for a, b in zip(fake_signature, real_signature))
+def _structure_consistency(fake, real, fake_masks, real_masks):
+    """One orthogonal structural objective for every annotated foreground class."""
+    total = fake.new_tensor(0.0)
+    class_count = max(fake_masks.shape[1] - 1, 1)
+    for channel in range(1, fake_masks.shape[1]):
+        fake_signature = _boundary_signature(
+            fake, fake_masks[:, channel:channel + 1]
+        )
+        real_signature = _boundary_signature(
+            real, real_masks[:, channel:channel + 1]
+        )
+        total = total + sum(
+            F.l1_loss(a, b) for a, b in zip(fake_signature, real_signature)
+        )
+    return total / class_count
 
 
-def _same_mask_diversity(fake_a, fake_b, masks, margin):
-    image_a, image_b = fake_a["images"][-1], fake_b["images"][-1]
-    inside = masks[:, 1:2]
-    outside = masks[:, :1]
-    inside_delta = ((image_a - image_b).abs() * inside).sum() / (
-        inside.sum().clamp_min(1.0) * image_a.shape[1]
-    )
-    outside_delta = ((image_a - image_b).abs() * outside).sum() / (
-        outside.sum().clamp_min(1.0) * image_a.shape[1]
-    )
-    return F.relu(image_a.new_tensor(margin) - 0.5 * (inside_delta + outside_delta))
+def _decayed_weight(initial, final_ratio, start, end, epoch):
+    if epoch <= start:
+        ratio = 1.0
+    elif epoch >= end:
+        ratio = final_ratio
+    else:
+        progress = (epoch - start) / max(end - start, 1)
+        ratio = 1.0 - progress * (1.0 - final_ratio)
+    return initial * ratio
 
 
-def guided_generator_losses(fake_a, fake_b, anchor, real, opt):
-    """Distributional constraints for one real image and mask-only conditions."""
-    fake_image = fake_a["images"][-1]
+def guided_generator_losses(fake, anchor, real, opt, epoch):
+    """Minimal non-adversarial objectives: structure plus one reconstruction anchor."""
+    fake_image = fake["images"][-1]
     real_image = real["images"][-1]
-    fake_masks = fake_a["masks"]
+    fake_masks = fake["masks"]
     real_masks = real["masks"]
+    anchor_weight = _decayed_weight(
+        opt.lambda_anchor,
+        opt.anchor_final_ratio,
+        opt.anchor_decay_start,
+        opt.anchor_decay_end,
+        epoch,
+    )
     return {
-        "texture": _texture_statistics_loss(
+        "structure": _structure_consistency(
             fake_image, real_image, fake_masks, real_masks
-        ) * opt.lambda_texture,
-        "frequency": _frequency_distribution_loss(
-            fake_image, real_image
-        ) * opt.lambda_frequency,
-        "alignment": _alignment_loss(
-            fake_image, real_image, fake_masks, real_masks
-        ) * opt.lambda_alignment,
-        "same_mask_div": _same_mask_diversity(
-            fake_a, fake_b, fake_masks, opt.diversity_margin
-        ) * opt.lambda_same_mask_div,
-        # Only this fixed latent/mask pair reconstructs the source image.
-        "anchor": F.l1_loss(anchor["images"][-1], real_image[:1]) * opt.lambda_anchor,
+        ) * opt.lambda_structure,
+        "anchor": F.l1_loss(
+            anchor["images"][-1], real_image[:1]
+        ) * anchor_weight,
     }
+
+
+def latent_reconstruction_loss(prediction, target, weight):
+    return F.smooth_l1_loss(prediction, target.flatten(1)) * weight
 
 
 def wgan_loss(output, real, forD):

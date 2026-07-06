@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
-EXP_NAME="${EXP_NAME:-test2_multiprior_5090}"
-DATASET_NAME="${DATASET_NAME:-rendered_us_test2_multiprior}"
+EXP_NAME="${EXP_NAME:-test2_online_minimal_5090}"
+DATASET_NAME="${DATASET_NAME:-rendered_us_test2_online}"
 NUM_GENERATED="${NUM_GENERATED:-50}"
 EPOCH="${1:-}"
 
