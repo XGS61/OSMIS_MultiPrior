@@ -1,134 +1,97 @@
-# OSMIS Full-SEAN Hierarchical One-Shot Ultrasound
+# OSMIS HierSPADE Quick Verification
 
-This repository trains on exactly one rendered pelvic-floor ultrasound C-plane
-image and one review annotation. OSMIS remains the single generator and
-discriminator backbone. There is no SinGAN pyramid, offline pseudo-image set,
-or fixed mask bank.
+This repository is configured for the current quick verification experiment on
+one rendered pelvic-floor ultrasound C-plane image.  The goal is to test whether
+the clean texture pathway from the earlier 31k online-minimal model can be kept
+while hierarchical anatomy labels constrain the internal levator-hiatus
+structure.
 
-## Current model
+The repository trains on exactly one real image and one annotation.  No warped
+image is treated as a real target, and no fixed 64-mask bank is used.
+
+## Current default model
 
 ```text
-one hierarchical annotation
-        + random shape parameters
-        -> online topology-aware condition sampler
-        -> fresh valid structural condition M(u)
+z_global
+    -> first_linear
+    -> one OSMIS generator
 
-one real image + exclusive semantic regions
-        -> regional real-patch style encoder
-        -> per-region style codes
+0..5 hierarchical mask
+    -> low/mid SPADE blocks only
+    -> controls shape and internal anatomy layout
 
-learned OSMIS input
-        -> one OSMIS generator
-        -> every OSMIS G-block uses full SEAN-style dual modulation
-           (hierarchical mask branch + regional style branch)
-        -> generated image
+collapsed binary target/non-target mask
+    + one real image style descriptor
+    + z_texture
+    + high-resolution noise injection
+    -> high-resolution texture blocks
+    -> controls appearance without giving class 3/4/5 appearance identities
 
-regional z_texture changes texture only
-M(u) determines anatomy and is saved as the output annotation
+output image + sampled 0..5 mask
 ```
 
-The discriminator is the single OSMIS discriminator with low-level, masked
-content, and weak layout branches. It is used only during training.
+This is intentionally not the previous full-SEAN hierarchy.  Full-SEAN allowed
+small internal classes to become appearance regions and produced visible
+semantic/color leakage.  In this quick model, the detailed 0..5 labels guide
+only structure in the SPADE layers.  The texture path sees only target versus
+non-target.
 
-## What is different from the previous checkpoint
+## Included data
 
-- All OSMIS generator blocks now use full SEAN-style dual modulation.
-- The former unconstrained `z_global` is replaced by a learned input tensor.
-- Anatomy variation comes only from the validated hierarchical condition.
-- `z_texture` is sampled independently for all six exclusive style regions.
-- The fixed global-statistics style code is replaced by real regional patch
-  style sampling from the one source image.
-- The ineffective discriminator latent regressor is removed.
-- A single region-restricted, high-frequency mode-seeking objective makes
-  `z_texture` observable without rewarding low-frequency anatomy changes.
-
-Old 31k and 99k weights are architecturally incompatible and cannot be resumed.
-
-## Included annotation draft
-
-The source assets are:
+Source assets:
 
 ```text
 datasets/rendered_us_test2_source/
 datasets/rendered_us_test2_multilevel_draft/
 ```
 
-The hierarchy contains seven structural channels:
+The indexed mask uses:
 
 ```text
-0 rendered support
-1 supplied levator-hiatus annotation
-2 anterior internal candidate
-3 middle internal candidate
-4 posterior internal candidate
-5 hiatus boundary
-6 signed hiatus distance
+0 background
+1 rendered support outside target
+2 levator-hiatus target remainder
+3 anterior internal candidate
+4 middle internal candidate
+5 posterior internal candidate
 ```
 
-The indexed visualization has six exclusive style regions:
+Classes 3..5 are development annotations derived from intensity and position.
+They are not independently validated clinical labels.
+
+`run_5090.sh` prepares the training dataset automatically:
 
 ```text
-0 outside support
-1 rendered tissue
-2 hiatus remainder
-3 anterior candidate
-4 middle candidate
-5 posterior candidate
+datasets/rendered_us_test2_hierspade_quick/
 ```
 
-The internal candidates were derived from position and intensity for model
-development. They are review annotations, not independently validated clinical
-ground truth. Do not report them as clinical labels without expert review.
+This prepared directory is ignored by git because it is reproducible from the
+tracked source image and indexed mask.
 
-`tools/create_multilevel_mask_draft.py` reproduces the draft. The training
-pipeline uses `hierarchical_conditions.npz`, which preserves parent-child
-overlap instead of flattening the hierarchy.
+## Online anatomy sampling
 
-## Online mask generation
+Every batch receives a fresh mask condition.  The sampler applies bounded global
+affine and smooth elastic deformation, then jitters internal candidates inside
+the target.  It rejects masks with implausible area, centroid, or internal-area
+changes.
 
-Every training batch and inference sample receives a fresh condition:
-
-1. apply one bounded global affine and smooth elastic field to support, hiatus,
-   and internal structures;
-2. apply smaller relative transformations to internal candidates;
-3. enforce containment and non-overlap;
-4. preserve anterior-middle-posterior ordering;
-5. reject invalid area or centroid changes;
-6. regenerate exclusive regions, boundary, and signed-distance channels.
-
-This process creates conditions only. It never warps the source image or adds
-any pseudo-image to the real training distribution.
-
-## Generator conditioning
-
-All stages belong to one OSMIS generator:
+The current defaults are deliberately less conservative than the earlier quick
+test:
 
 ```text
-5 -> 10 -> 20 -> 40 -> 80 -> 160 -> 320 pixels
+max rotation:        +/- 7 degrees
+scale_x:             0.84 .. 1.16
+scale_y:             0.88 .. 1.12
+translation:         +/- 0.09 normalized grid units
+smooth displacement: 0.04 image fraction
+accepted area ratio: 0.68 .. 1.42
+centroid shift:      <= 0.10
+internal jitter:     +/- 3 degrees, 0.88 .. 1.12 scale
 ```
 
-This is not a set of independently trained scale GANs. The same condition is
-resized continuously for each OSMIS block:
+These values are meant for verification, not final clinical validation.
 
-- low resolution: mask branch dominates global anatomy;
-- middle resolution: mask and style are balanced;
-- high resolution: regional style is stronger while mask control remains.
-
-## Objective
-
-```text
-L_G = L_OSMIS-adversarial
-    + lambda_structure * L_structure
-    + lambda_diversity * L_high-frequency-region-diversity
-    + lambda_anchor(t) * L_anchor
-```
-
-The diversity loss compares two images generated from the same condition and
-the same reference style but different regional texture latents. It operates
-on high-pass image content inside each semantic region. The anchor and layout
-weights decay after warm-up.
-
-## RTX 5090
+## RTX 5090 quick run
 
 Create the environment once:
 
@@ -137,7 +100,7 @@ bash setup_5090.sh
 conda activate osmis_multiprior_5090
 ```
 
-Train the included case:
+Train the default quick experiment:
 
 ```bash
 bash run_5090.sh
@@ -145,19 +108,30 @@ bash run_5090.sh
 
 Defaults:
 
-- experiment: `test2_fullsean_hierarchical_5090`
-- image size: 320 x 320
-- batch size: 16
-- iterations: 100,000
-- checkpoint and monitor interval: 1,000
+```text
+experiment:   test2_hierspade_quick_5090
+dataset:      rendered_us_test2_hierspade_quick
+iterations:   5,000
+batch size:   16
+monitor/save: every 500 iterations
+```
+
+If a local 31k online-minimal checkpoint exists at:
+
+```text
+checkpoints/test2_online_minimal_31000_imported/models/
+```
+
+the script uses it for partial initialization.  If it is absent, training starts
+from scratch and continues normally.
 
 Override without editing:
 
 ```bash
-NUM_EPOCHS=5000 BATCH_SIZE=8 EXP_NAME=fullsean_smoke bash run_5090.sh
+NUM_EPOCHS=10000 BATCH_SIZE=8 EXP_NAME=my_hierspade_test bash run_5090.sh
 ```
 
-Generate 50 samples from the latest checkpoint:
+Generate samples:
 
 ```bash
 bash generate_5090.sh
@@ -166,37 +140,26 @@ bash generate_5090.sh
 Or choose a checkpoint:
 
 ```bash
-bash generate_5090.sh 50000
+bash generate_5090.sh 5000
 ```
 
-Each generated image is accompanied by the six-class label map and a
-`*_primary_mask.png` binary downstream target. The primary target is the union
-of label values `2..5`, so adding internal conditions does not change the
-original levator-hiatus segmentation task.
+## What to inspect
 
-## Monitoring
+This quick experiment is useful only if all three are true:
 
-Every monitor contains:
+- the image keeps the cleaner 31k-style rendered ultrasound texture;
+- the internal structures begin to respond to the sampled 0..5 mask;
+- class 3/4/5 do not leave color or annotation-like residue.
 
-- first eight images: identical anatomy and reference style, varied
-  region-specific `z_texture`;
-- last eight images: fixed `z_texture`, freshly sampled valid anatomy.
-
-This separates texture collapse from condition collapse.
-
-## Scope and limitation
-
-The implementation can enforce explicit topology and produce controlled
-variation around one annotated case. A single case cannot identify the true
-population distribution or validate the anatomical identity of automatically
-proposed internal regions. Clinical validity and downstream segmentation gain
-must be evaluated independently.
+If the texture remains clean but the internal structure does not respond by
+5k-10k iterations, low/mid SPADE alone is probably not enough and a stronger
+structure objective or soft internal prior should be tested next.
 
 ## Provenance
 
 - OSMIS: https://github.com/boschresearch/one-shot-synthesis
-- SEAN reference: https://github.com/ZPdesu/SEAN
 - SPADE reference: https://github.com/NVlabs/SPADE
+- SEAN reference for earlier experiments: https://github.com/ZPdesu/SEAN
 
 See [UPSTREAM.md](UPSTREAM.md), [LICENSE](LICENSE), and
 [3rd-party-licenses.txt](3rd-party-licenses.txt).

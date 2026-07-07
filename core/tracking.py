@@ -145,14 +145,6 @@ class image_saver():
                 epoch + f"_mask_label{suffix}.png",
             )
             Image.fromarray(label, mode="L").save(path)
-            # The downstream levator-hiatus target is the hierarchy union:
-            # hiatus remainder (2) plus all three internal candidates (3..5).
-            primary = (label >= 2).astype(np.uint8) * 255
-            primary_path = os.path.join(
-                self.folder_images,
-                epoch + f"_primary_mask{suffix}.png",
-            )
-            Image.fromarray(primary, mode="L").save(primary_path)
 
     def paint_mask(self, masks):
         ans = torch.zeros((masks.shape[0], 3, masks.shape[2], masks.shape[3]))

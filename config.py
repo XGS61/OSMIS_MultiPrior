@@ -43,8 +43,10 @@ def get_arguments():
 
     # training:
     parser.add_argument('--batch_size', type=int, help='batch_size', default=5)
+    parser.add_argument('--global_noise_dim', type=int, default=32,
+                        help='global/layout latent dimension')
     parser.add_argument('--texture_noise_dim', type=int, default=32,
-                        help='dimension of every region-specific texture latent')
+                        help='regional texture latent dimension')
     parser.add_argument('--lr_g', type=float, default=0.0002, help='generator learning rate')
     parser.add_argument('--lr_d', type=float, default=0.0002, help='discriminator learning rate')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam')
@@ -61,17 +63,17 @@ def get_arguments():
     parser.add_argument('--layout_final_ratio', type=float, default=0.25)
     parser.add_argument('--lambda_structure', type=float, default=2.0,
                         help='single image-condition boundary consistency weight')
-    parser.add_argument('--lambda_diversity', type=float, default=0.25,
-                        help='region-restricted high-frequency mode-seeking weight')
-    parser.add_argument('--diversity_cap', type=float, default=0.20,
-                        help='cap for the mode-seeking image/latent distance ratio')
+    parser.add_argument('--lambda_latent', type=float, default=1.0,
+                        help='texture latent reconstruction weight for G and E_z')
     parser.add_argument('--lambda_anchor', type=float, default=0.5,
                         help='single fixed-latent reconstruction anchor weight')
     parser.add_argument('--anchor_decay_start', type=int, default=5000)
     parser.add_argument('--anchor_decay_end', type=int, default=20000)
     parser.add_argument('--anchor_final_ratio', type=float, default=0.10)
-    parser.add_argument('--anatomy_max_displacement', type=float, default=0.025,
+    parser.add_argument('--anatomy_max_displacement', type=float, default=0.04,
                         help='online smooth mask displacement as image fraction')
+    parser.add_argument('--init_from_31000_dir', default="",
+                        help='optional 31000 online-minimal models/ directory for partial HierSPADE initialization')
     parser.add_argument('--prob_FA_con', type=float, help='probability of content FA', default=0.4)
     parser.add_argument('--prob_FA_lay', type=float, help='probability of layout FA', default=0.4)
     parser.add_argument('--no_EMA', action="store_true", help='deactivate exponential moving average of G weights?')

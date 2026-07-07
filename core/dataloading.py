@@ -1,6 +1,4 @@
 import os
-import json
-import numpy as np
 import torch
 import warnings
 from PIL import Image
@@ -17,8 +15,7 @@ def prepare_dataloading(opt):
                           "num_blocks_d":  dataset.recommended_config[2],
                           "num_blocks_d0": dataset.recommended_config[3],
                           "no_masks": dataset.no_masks,
-                          "num_mask_channels": dataset.num_mask_channels,
-                          "num_condition_channels": dataset.num_condition_channels}
+                          "num_mask_channels": dataset.num_mask_channels}
     if not recommended_config["no_masks"] and not opt.no_masks:
         print("Using the training regime *with* segmentation masks")
     else:
@@ -43,9 +40,6 @@ class Dataset(torch.utils.data.Dataset):
         # --- images --- #
         self.root_images = os.path.join(opt.dataroot, opt.dataset_name, "image")
         self.root_masks = os.path.join(opt.dataroot, opt.dataset_name, "mask")
-        self.root_conditions = os.path.join(
-            opt.dataroot, opt.dataset_name, "condition"
-        )
         self.list_imgs = self.get_frames_list(self.root_images)
         assert len(self.list_imgs) > 0, "Found no images"
         self.image_resolution, self.recommended_config = get_recommended_config(self.get_im_resolution(opt.max_size))
@@ -59,36 +53,10 @@ class Dataset(torch.utils.data.Dataset):
                 assert os.path.splitext(self.list_imgs[i])[0] == os.path.splitext(self.list_masks[i])[0], \
                 "Image and its mask must have same names %s - %s" % (self.list_imgs[i], self.list_masks[i])
             self.num_mask_channels = self.get_num_mask_channels()
-            self.list_conditions = (
-                sorted(
-                    file_name
-                    for file_name in os.listdir(self.root_conditions)
-                    if file_name.endswith(".npz")
-                )
-                if os.path.isdir(self.root_conditions)
-                else []
-            )
-            if self.list_conditions:
-                assert len(self.list_conditions) == len(self.list_imgs), (
-                    "Different number of images and hierarchical conditions "
-                    f"{len(self.list_imgs)} vs {len(self.list_conditions)}"
-                )
-                metadata_path = os.path.join(
-                    opt.dataroot, opt.dataset_name, "metadata.json"
-                )
-                metadata = json.load(open(metadata_path, encoding="utf-8"))
-                self.num_condition_channels = int(
-                    metadata["num_condition_channels"]
-                )
-            else:
-                # Backward-compatible fallback: semantic one-hot maps are also
-                # the structural condition.
-                self.num_condition_channels = self.num_mask_channels
             self.no_masks = False
         else:
             self.no_masks = True
             self.num_mask_channels = None
-            self.num_condition_channels = None
 
         print("Created a dataset of size =", len(self.list_imgs), "with image resolution", self.image_resolution)
 
@@ -171,27 +139,6 @@ class Dataset(torch.utils.data.Dataset):
         pad_bottom = target_h - new_h - pad_top
         return F.pad(image, (pad_left, pad_top, pad_right, pad_bottom), fill=fill)
 
-    def resize_tensor_with_pad(self, tensor, target_size):
-        """Resize continuous hierarchical channels without destroying small labels."""
-        target_h, target_w = target_size
-        source_h, source_w = tensor.shape[-2:]
-        scale = min(target_w / source_w, target_h / source_h)
-        new_w = max(1, int(round(source_w * scale)))
-        new_h = max(1, int(round(source_h * scale)))
-        tensor = torch.nn.functional.interpolate(
-            tensor.unsqueeze(0),
-            size=(new_h, new_w),
-            mode="bilinear",
-            align_corners=False,
-        )[0]
-        pad_left = (target_w - new_w) // 2
-        pad_right = target_w - new_w - pad_left
-        pad_top = (target_h - new_h) // 2
-        pad_bottom = target_h - new_h - pad_top
-        return torch.nn.functional.pad(
-            tensor, (pad_left, pad_right, pad_top, pad_bottom)
-        )
-
     def __getitem__(self, index):
         output = dict()
         idx = index % len(self.list_imgs)
@@ -216,31 +163,6 @@ class Dataset(torch.utils.data.Dataset):
             mask = self.create_mask_channels(mask)  # mask should be N+1 channels
             output["masks"] = mask
             assert img.shape[1:] == mask.shape[1:], "Image and mask must have same dims %s" % (self.list_imgs[idx])
-            if self.list_conditions:
-                condition_path = os.path.join(
-                    self.root_conditions,
-                    os.path.splitext(self.list_imgs[idx])[0] + ".npz",
-                )
-                archive = np.load(condition_path)
-                conditions = torch.from_numpy(
-                    archive["conditions"].astype(np.float32)
-                )
-                if conditions.shape[0] != self.num_condition_channels:
-                    raise ValueError(
-                        f"Unexpected condition channel count in {condition_path}: "
-                        f"{conditions.shape[0]} vs {self.num_condition_channels}"
-                    )
-                conditions = self.resize_tensor_with_pad(
-                    conditions, target_size
-                )
-                # Binary hierarchy channels stay in [0, 1]. Signed distance is
-                # normalized independently and stays in [-1, 1].
-                conditions[:-1] = conditions[:-1].clamp(0, 1)
-                distance_scale = conditions[-1:].abs().amax().clamp_min(1.0)
-                conditions[-1:] = conditions[-1:] / distance_scale
-                output["conditions"] = conditions
-            else:
-                output["conditions"] = mask
         return output
 
 

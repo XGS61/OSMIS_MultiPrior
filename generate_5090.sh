@@ -4,16 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
-EXP_NAME="${EXP_NAME:-test2_fullsean_hierarchical_5090}"
-DATASET_NAME="${DATASET_NAME:-rendered_us_test2_fullsean}"
+EXP_NAME="${EXP_NAME:-test2_hierspade_quick_5090}"
+DATASET_NAME="${DATASET_NAME:-rendered_us_test2_hierspade_quick}"
 NUM_GENERATED="${NUM_GENERATED:-50}"
 EPOCH="${1:-}"
 
 if [[ ! -f "datasets/${DATASET_NAME}/metadata.json" ]]; then
-  python -u prepare_hierarchical_case.py \
+  python -u prepare_online_case.py \
     --image "datasets/rendered_us_test2_source/image/00000.jpg" \
-    --indexed-mask "datasets/rendered_us_test2_multilevel_draft/multilevel_mask_indexed.png" \
-    --conditions "datasets/rendered_us_test2_multilevel_draft/hierarchical_conditions.npz" \
+    --mask "datasets/rendered_us_test2_multilevel_draft/multilevel_mask_indexed.png" \
     --output "datasets/${DATASET_NAME}" \
     --crop-top 20 \
     --overwrite

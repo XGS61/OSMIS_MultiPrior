@@ -1,5 +1,4 @@
 import os
-import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,6 +15,124 @@ def load_state_dict_compat(path, device):
         return torch.load(path, map_location=device, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=device)
+
+
+def _latest_checkpoint_prefix(models_dir, suffix):
+    candidates = []
+    if not models_dir or not os.path.isdir(models_dir):
+        return None
+    for file_name in os.listdir(models_dir):
+        if file_name.endswith(suffix):
+            prefix = file_name[:-len(suffix)]
+            try:
+                candidates.append((int(prefix), prefix))
+            except ValueError:
+                continue
+    if not candidates:
+        return None
+    return max(candidates)[1]
+
+
+def _expand_spade_weight(old_w, new_w):
+    """Expand 31000 binary SPADE input weights to 0..5 hierarchy weights."""
+    out = new_w.clone()
+    # Old channels: 0 non-target, 1 target.  New channels:
+    # 0 background, 1 rendered support, 2 target remainder, 3..5 internals.
+    out[:, 0:1] = old_w[:, 0:1]
+    out[:, 1:2] = old_w[:, 0:1]
+    out[:, 2:] = old_w[:, 1:2].repeat(1, out.shape[1] - 2, 1, 1)
+    return out
+
+
+def _expand_content_weight(old_w, new_w):
+    """Expand OSMIS content classifier rows from binary to hierarchy rows."""
+    out = new_w.clone()
+    if old_w.ndim == 4:
+        out[0:1] = old_w[0:1]
+        out[1:2] = old_w[0:1]
+        out[2:6] = old_w[1:2].repeat(4, 1, 1, 1)
+        out[6:7] = old_w[2:3]
+    else:
+        out[0:1] = old_w[0:1]
+        out[1:2] = old_w[0:1]
+        out[2:6] = old_w[1:2].repeat(4)
+        out[6:7] = old_w[2:3]
+    return out
+
+
+def _partial_import_state(module, old_state, label):
+    new_state = module.state_dict()
+    copied = expanded = skipped = 0
+    for key in list(new_state.keys()):
+        if key not in old_state:
+            skipped += 1
+            continue
+        if old_state[key].shape == new_state[key].shape:
+            new_state[key] = old_state[key]
+            copied += 1
+        elif (
+            "norm" in key
+            and "shared.0.weight" in key
+            and old_state[key].ndim == 4
+            and old_state[key].shape[1] == 2
+            and new_state[key].shape[1] == 6
+        ):
+            new_state[key] = _expand_spade_weight(old_state[key], new_state[key])
+            expanded += 1
+        elif (
+            "final_content" in key
+            and old_state[key].shape[0] == 3
+            and new_state[key].shape[0] == 7
+        ):
+            new_state[key] = _expand_content_weight(old_state[key], new_state[key])
+            expanded += 1
+        else:
+            skipped += 1
+    module.load_state_dict(new_state)
+    print(
+        f"Partially initialized {label} from 31000: "
+        f"copied={copied}, expanded={expanded}, skipped={skipped}"
+    )
+
+
+def maybe_initialize_from_31000(opt, netG, netD, netEMA):
+    if opt.phase != "train" or opt.continue_train:
+        return
+    models_dir = getattr(opt, "init_from_31000_dir", "")
+    if not models_dir:
+        return
+    if not os.path.isdir(models_dir):
+        print(f"31000 init skipped; directory not found: {models_dir}")
+        return
+    prefix = _latest_checkpoint_prefix(models_dir, "_G.pth")
+    if prefix is None:
+        print(f"31000 init skipped; no *_G.pth files in: {models_dir}")
+        return
+    print(f"Initializing HierSPADE quick model from 31000 checkpoint {prefix}")
+    _partial_import_state(
+        netG,
+        load_state_dict_compat(os.path.join(models_dir, f"{prefix}_G.pth"), opt.device),
+        "G",
+    )
+    if not opt.no_EMA and netEMA is not None:
+        ema_path = os.path.join(models_dir, f"{prefix}_G_EMA.pth")
+        if os.path.exists(ema_path):
+            _partial_import_state(
+                netEMA,
+                load_state_dict_compat(ema_path, opt.device),
+                "G_EMA",
+            )
+        else:
+            netEMA.load_state_dict(netG.state_dict())
+            print("31000 EMA checkpoint missing; copied initialized G into EMA")
+    if netD is not None:
+        d_path = os.path.join(models_dir, f"{prefix}_D.pth")
+        if os.path.exists(d_path):
+            _partial_import_state(
+                netD,
+                load_state_dict_compat(d_path, opt.device),
+                "D",
+            )
 
 
 def create_models(opt, recommended_config):
@@ -53,6 +170,7 @@ def create_models(opt, recommended_config):
             os.path.join(path, str(opt.continue_epoch)+"_D.pth"), opt.device
         ))
         print("Loaded Discriminator checkpoint")
+    maybe_initialize_from_31000(opt, netG, netD, netEMA)
     return netG, netD, netEMA
 
 
@@ -67,17 +185,14 @@ def prepare_config(opt, recommended_config):
     Create model configuration dicts based on recommended settings and input parameters.
     Recommended num_blocks_d and num_blocks_d0 can be overridden by user inputs
     """
-    G_keys_recommended = [
-        'noise_shape', 'num_blocks_g', "no_masks", "num_mask_channels",
-        "num_condition_channels",
-    ]
+    G_keys_recommended = ['noise_shape', 'num_blocks_g', "no_masks", "num_mask_channels"]
     D_keys_recommended = ['num_blocks_d', 'num_blocks_d0', "no_masks", "num_mask_channels"]
     G_keys_user = [
-        "ch_G", "norm_G", "texture_noise_dim", "style_dim"
+        "ch_G", "norm_G", "global_noise_dim", "texture_noise_dim", "style_dim"
     ]
     D_keys_user = [
         "ch_D", "norm_D", "prob_FA_con", "prob_FA_lay",
-        "bernoulli_warmup",
+        "bernoulli_warmup", "texture_noise_dim"
     ]
 
     config_G = dict((k, recommended_config[k]) for k in G_keys_recommended)
@@ -118,86 +233,93 @@ class Generator(nn.Module):
         super(Generator, self).__init__()
         self.num_blocks = config_G["num_blocks_g"]
         self.noise_shape = config_G["noise_shape"]
+        self.global_noise_dim = config_G["global_noise_dim"]
         self.texture_noise_dim = config_G["texture_noise_dim"]
         self.norm_name = config_G["norm_G"]
         self.no_masks = config_G["no_masks"]
         self.num_mask_channels = config_G["num_mask_channels"]
-        self.num_condition_channels = config_G["num_condition_channels"]
+        # Quick hierarchical-SPADE experiment:
+        # keep the rich 0..5 anatomy mask for low/mid SPADE structure control,
+        # but collapse it to the original binary target/non-target layout for
+        # high-resolution style/texture blocks.  This preserves the 31000
+        # texture pathway and prevents class 3/4/5 from becoming appearance
+        # regions.
+        self.num_texture_channels = 2 if not self.no_masks else None
         self.style_dim = config_G["style_dim"]
         num_of_channels = get_channels("Generator", config_G["ch_G"])[-self.num_blocks-1:]
 
         self.body, self.rgb_converters = nn.ModuleList([]), nn.ModuleList([])
-        self.learned_input = nn.Parameter(
-            torch.randn(1, num_of_channels[0], *self.noise_shape) * 0.02
+        self.first_linear = nn.ConvTranspose2d(
+            self.global_noise_dim, num_of_channels[0], self.noise_shape
         )
         self.style_encoder = RegionStyleEncoder(
-            self.num_mask_channels, self.style_dim
+            self.num_texture_channels, self.style_dim
         ) if not self.no_masks else None
+        low_end = max(1, self.num_blocks - 4)
+        high_start = max(low_end + 1, self.num_blocks - 2)
         for i in range(self.num_blocks):
-            progress = i / max(self.num_blocks - 1, 1)
-            if progress < 0.4:
-                style_bounds = (0.0, 0.15)
-            elif progress < 0.75:
-                style_bounds = (0.15, 0.55)
+            if self.no_masks or i < low_end:
+                condition_mode = "none"
+            elif i < high_start:
+                condition_mode = "spade"
             else:
-                style_bounds = (0.45, 0.85)
+                condition_mode = "sean"
             cur_block = G_block(
                 num_of_channels[i],
                 num_of_channels[i + 1],
+                self.norm_name,
                 i == 0,
-                self.num_condition_channels,
-                self.num_mask_channels,
+                None if self.no_masks else (
+                    self.num_mask_channels
+                    if condition_mode == "spade"
+                    else self.num_texture_channels
+                ),
+                condition_mode=condition_mode,
                 style_dim=self.style_dim,
                 noise_dim=self.texture_noise_dim,
-                style_bounds=style_bounds,
             )
             cur_rgb   = to_rgb(num_of_channels[i+1])
             self.body.append(cur_block)
             self.rgb_converters.append(cur_rgb)
         print("Created Generator with %d parameters" % (sum(p.numel() for p in self.parameters())))
 
-    def encode_style(
-        self,
-        style_images=None,
-        style_masks=None,
-        output_count=None,
-        randomize_patches=True,
-    ):
-        if self.no_masks:
-            return None
-        return self.style_encoder(
-            style_images,
-            style_masks,
-            output_count=output_count,
-            randomize_patches=randomize_patches,
-        )
+    @staticmethod
+    def collapse_to_texture_masks(masks):
+        if masks is None or masks.shape[1] <= 2:
+            return masks
+        # 0: outside/non-target = background + rendered tissue outside hiatus.
+        # 1: target = hiatus remainder + internal candidate classes.
+        non_target = masks[:, :2].sum(dim=1, keepdim=True).clamp(0, 1)
+        target = masks[:, 2:].sum(dim=1, keepdim=True).clamp(0, 1)
+        return torch.cat((non_target, target), dim=1)
 
     def generate(
         self,
+        z_global,
         z_texture,
-        conditions=None,
         masks=None,
         style_images=None,
         style_masks=None,
-        style_codes=None,
         get_feat=False,
-        randomize_style=True,
+        randomize_noise=True,
     ):
-        if conditions is None or masks is None:
-            raise ValueError("The generator requires hierarchical conditions and region masks.")
-        if style_codes is None:
-            if style_images is None or style_masks is None:
-                raise ValueError("The generator requires the single real style reference.")
-            style_codes = self.encode_style(
-                style_images,
-                style_masks,
-                output_count=conditions.shape[0],
-                randomize_patches=randomize_style,
-            )
-        output, ans_images, ans_feat = {}, [], []
-        x = self.learned_input.expand(conditions.shape[0], -1, -1, -1)
+        if not self.no_masks and masks is None:
+            raise ValueError("The generator requires a target anatomy mask.")
+        if not self.no_masks and (style_images is None or style_masks is None):
+            raise ValueError("The generator requires the single real image/mask as style reference.")
+        output = dict()
+        ans_images = list()
+        ans_feat = list()
+        style_codes = None
+        texture_masks = self.collapse_to_texture_masks(masks)
+        texture_style_masks = self.collapse_to_texture_masks(style_masks)
+        if not self.no_masks:
+            style_codes = self.style_encoder(style_images, texture_style_masks)
+        x = self.first_linear(z_global)
         for i in range(self.num_blocks):
-            x = self.body[i](x, conditions, masks, style_codes, z_texture)
+            x = self.body[
+                i
+            ](x, masks, texture_masks, style_codes, z_texture, randomize_noise)
             im = torch.tanh(self.rgb_converters[i](x))
             ans_images.append(im)
             ans_feat.append(torch.tanh(x))
@@ -205,8 +327,8 @@ class Generator(nn.Module):
 
         if get_feat:
              output["features"] = ans_feat
-        output["masks"] = masks
-        output["conditions"] = conditions
+        if not self.no_masks:
+            output["masks"] = masks
         return output
 
 
@@ -215,44 +337,66 @@ class G_block(nn.Module):
         self,
         in_channel,
         out_channel,
+        norm_name,
         is_first,
-        num_condition_channels,
-        num_regions,
+        num_mask_channels=None,
+        condition_mode="none",
         style_dim=32,
         noise_dim=64,
-        style_bounds=(0.0, 1.0),
     ):
         super(G_block, self).__init__()
         middle_channel = min(in_channel, out_channel)
+        self.condition_mode = condition_mode
         self.ups = nn.Upsample(scale_factor=2) if not is_first else torch.nn.Identity()
         self.activ = nn.LeakyReLU(0.2)
         self.conv1 = sp_norm(nn.Conv2d(in_channel,  middle_channel, 3, padding=1))
         self.conv2 = sp_norm(nn.Conv2d(middle_channel, out_channel, 3, padding=1))
-        self.norm1 = SEAN(
-            in_channel,
-            num_condition_channels,
-            num_regions,
-            style_dim,
-            noise_dim,
-            style_bounds,
-        )
-        self.norm2 = SEAN(
-            middle_channel,
-            num_condition_channels,
-            num_regions,
-            style_dim,
-            noise_dim,
-            style_bounds,
-        )
+        if self.condition_mode == "spade":
+            self.norm1 = SPADE(in_channel, num_mask_channels)
+            self.norm2 = SPADE(middle_channel, num_mask_channels)
+        elif self.condition_mode == "sean":
+            self.norm1 = RegionStyleNorm(
+                in_channel, num_mask_channels, style_dim, noise_dim
+            )
+            self.norm2 = RegionStyleNorm(
+                middle_channel, num_mask_channels, style_dim, noise_dim
+            )
+            self.noise_strength1 = nn.Parameter(torch.zeros(1))
+            self.noise_strength2 = nn.Parameter(torch.zeros(1))
+        else:
+            self.norm1 = get_norm_by_name(norm_name, in_channel)
+            self.norm2 = get_norm_by_name(norm_name, middle_channel)
         self.conv_sc = sp_norm(nn.Conv2d(in_channel, out_channel, (1, 1), bias=False))
 
-    def forward(self, x, conditions, masks, style_codes, z_texture):
+    def forward(
+        self,
+        x,
+        shape_masks=None,
+        texture_masks=None,
+        style_codes=None,
+        z=None,
+        randomize_noise=True,
+    ):
         h = x
-        x = self.norm1(x, conditions, masks, style_codes, z_texture)
+        if self.condition_mode == "spade":
+            x = self.norm1(x, shape_masks)
+        elif self.condition_mode == "sean":
+            x = self.norm1(x, texture_masks, style_codes, z)
+            if randomize_noise:
+                x = x + torch.randn_like(x) * self.noise_strength1
+        else:
+            x = self.norm1(x)
         x = self.activ(x)
         x = self.ups(x)
         x = self.conv1(x)
-        x = self.norm2(x, conditions, masks, style_codes, z_texture)
+        if self.condition_mode == "spade":
+            x = self.norm2(x, shape_masks)
+        elif self.condition_mode == "sean":
+            x = self.norm2(x, texture_masks, style_codes, z)
+            if randomize_noise:
+                x = x + torch.randn_like(x) * self.noise_strength2
+        else:
+            x = self.norm2(x)
         x = self.activ(x)
         x = self.conv2(x)
         h = self.ups(h)
@@ -260,139 +404,77 @@ class G_block(nn.Module):
         return h + x
 
 
+class SPADE(nn.Module):
+    """Lightweight spatially-adaptive normalization for semantic anatomy maps."""
+
+    def __init__(self, channels, num_mask_channels, hidden=64):
+        super().__init__()
+        self.param_free_norm = nn.InstanceNorm2d(channels, affine=False)
+        self.shared = nn.Sequential(
+            nn.Conv2d(num_mask_channels, hidden, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.gamma = nn.Conv2d(hidden, channels, kernel_size=3, padding=1)
+        self.beta = nn.Conv2d(hidden, channels, kernel_size=3, padding=1)
+
+    def forward(self, features, masks):
+        masks = F.interpolate(masks, size=features.shape[2:], mode="nearest")
+        condition = self.shared(masks)
+        normalized = self.param_free_norm(features)
+        return normalized * (1.0 + self.gamma(condition)) + self.beta(condition)
+
+
 class RegionStyleEncoder(nn.Module):
-    """Encode multiple real patch styles per exclusive semantic region."""
+    """SEAN-inspired regional style encoder using the one actual image only."""
 
     def __init__(self, num_regions, style_dim):
         super().__init__()
         self.num_regions = num_regions
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1),
+        # RGB mean/std plus grayscale gradient mean/std per region.
+        self.mlp = nn.Sequential(
+            nn.Linear(8, 64),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, style_dim, 3, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.project = nn.Sequential(
-            nn.Linear(style_dim, style_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(style_dim, style_dim),
+            nn.Linear(64, style_dim),
         )
 
-    def forward(self, image, masks, output_count=None, randomize_patches=True):
-        features = self.encoder(image)
-        masks = F.interpolate(
-            masks, size=features.shape[2:], mode="nearest"
-        )
-        output_count = output_count or image.shape[0]
-        codes = []
-        for output_index in range(output_count):
-            source_index = output_index % image.shape[0]
-            region_codes = []
-            for region_index in range(self.num_regions):
-                region = masks[
-                    source_index:source_index + 1,
-                    region_index:region_index + 1,
-                ]
-                weights = region
-                if randomize_patches:
-                    positions = torch.nonzero(region[0, 0] > 0.5)
-                    if positions.shape[0] > 0:
-                        chosen = positions[
-                            torch.randint(
-                                positions.shape[0],
-                                (1,),
-                                device=positions.device,
-                            )
-                        ][0]
-                        radius = int(
-                            torch.randint(3, 9, (1,), device=positions.device)
-                        )
-                        local = torch.zeros_like(region)
-                        y0 = max(int(chosen[0]) - radius, 0)
-                        y1 = min(int(chosen[0]) + radius + 1, region.shape[2])
-                        x0 = max(int(chosen[1]) - radius, 0)
-                        x1 = min(int(chosen[1]) + radius + 1, region.shape[3])
-                        local[:, :, y0:y1, x0:x1] = 1
-                        local = local * region
-                        if local.sum() >= 4:
-                            weights = local
-                pooled = (
-                    features[source_index:source_index + 1] * weights
-                ).sum((2, 3)) / weights.sum((2, 3)).clamp_min(1.0)
-                region_codes.append(self.project(pooled)[0])
-            codes.append(torch.stack(region_codes))
-        return torch.stack(codes)
+    def forward(self, image, masks):
+        masks = F.interpolate(masks, size=image.shape[2:], mode="nearest")
+        gray = image.mean(dim=1, keepdim=True)
+        grad_x = F.pad(torch.abs(gray[:, :, :, 1:] - gray[:, :, :, :-1]), (0, 1, 0, 0))
+        descriptors = []
+        for region_index in range(self.num_regions):
+            region = masks[:, region_index:region_index + 1]
+            count = region.sum((2, 3)).clamp_min(1.0)
+            rgb_mean = (image * region).sum((2, 3)) / count
+            rgb_var = (((image - rgb_mean[:, :, None, None]) ** 2) * region).sum((2, 3)) / count
+            grad_mean = (grad_x * region).sum((2, 3)) / count
+            grad_var = (((grad_x - grad_mean[:, :, None, None]) ** 2) * region).sum((2, 3)) / count
+            descriptor = torch.cat(
+                (rgb_mean, torch.sqrt(rgb_var + 1e-6), grad_mean, torch.sqrt(grad_var + 1e-6)),
+                dim=1,
+            )
+            descriptors.append(self.mlp(descriptor))
+        return torch.stack(descriptors, dim=1)
 
 
-class SEAN(nn.Module):
-    """Full SEAN-style mask and region-style adaptive normalization."""
+class RegionStyleNorm(nn.Module):
+    """Spatial normalization modulated by region style and the current latent."""
 
-    def __init__(
-        self,
-        channels,
-        num_condition_channels,
-        num_regions,
-        style_dim,
-        noise_dim,
-        style_bounds,
-        hidden=64,
-    ):
+    def __init__(self, channels, num_regions, style_dim, noise_dim):
         super().__init__()
+        self.num_regions = num_regions
         self.norm = nn.InstanceNorm2d(channels, affine=False)
-        self.mask_shared = nn.Sequential(
-            nn.Conv2d(num_condition_channels, hidden, 3, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.mask_gamma = nn.Conv2d(hidden, channels, 3, padding=1)
-        self.mask_beta = nn.Conv2d(hidden, channels, 3, padding=1)
+        self.style_affine = nn.Linear(style_dim, channels * 2)
         self.latent_affine = nn.Linear(noise_dim, style_dim)
-        self.style_shared = nn.Sequential(
-            nn.Conv2d(style_dim, hidden, 3, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.style_gamma = nn.Conv2d(hidden, channels, 3, padding=1)
-        self.style_beta = nn.Conv2d(hidden, channels, 3, padding=1)
-        self.style_min, self.style_max = style_bounds
-        initial = (sum(style_bounds) * 0.5 - self.style_min) / max(
-            self.style_max - self.style_min, 1e-6
-        )
-        initial = min(max(initial, 1e-4), 1 - 1e-4)
-        self.style_logit = nn.Parameter(
-            torch.tensor(math.log(initial / (1.0 - initial)))
-        )
 
-    def forward(self, features, conditions, masks, style_codes, z_texture):
-        conditions = F.interpolate(
-            conditions,
-            size=features.shape[2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        masks = F.interpolate(
-            masks,
-            size=features.shape[2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        mask_features = self.mask_shared(conditions)
-        mask_gamma = self.mask_gamma(mask_features)
-        mask_beta = self.mask_beta(mask_features)
-
-        latent_style = self.latent_affine(z_texture)
-        region_styles = style_codes + latent_style
-        style_map = torch.einsum("brhw,brd->bdhw", masks, region_styles)
-        style_features = self.style_shared(style_map)
-        style_gamma = self.style_gamma(style_features)
-        style_beta = self.style_beta(style_features)
-
-        alpha = self.style_min + (
-            self.style_max - self.style_min
-        ) * torch.sigmoid(self.style_logit)
-        gamma = (1.0 - alpha) * mask_gamma + alpha * style_gamma
-        beta = (1.0 - alpha) * mask_beta + alpha * style_beta
-        return self.norm(features) * (1.0 + gamma) + beta
+    def forward(self, features, masks, style_codes, z):
+        masks = F.interpolate(masks, size=features.shape[2:], mode="nearest")
+        latent = self.latent_affine(z.flatten(1)).unsqueeze(1)
+        affine = self.style_affine(style_codes + 0.15 * latent)
+        gamma, beta = affine.chunk(2, dim=-1)
+        gamma_map = torch.einsum("brhw,brc->bchw", masks, gamma)
+        beta_map = torch.einsum("brhw,brc->bchw", masks, beta)
+        return self.norm(features) * (1.0 + gamma_map) + beta_map
 
 
 class Discriminator(nn.Module):
@@ -404,6 +486,7 @@ class Discriminator(nn.Module):
         self.prob_FA = {"content": config_D["prob_FA_con"], "layout": config_D["prob_FA_lay"]}
         self.no_masks = config_D["no_masks"]
         self.num_mask_channels = config_D["num_mask_channels"]
+        self.texture_noise_dim = config_D["texture_noise_dim"]
         self.bernoulli_warmup = config_D["bernoulli_warmup"]
         num_of_channels = get_channels("Discriminator", config_D["ch_D"])[:self.num_blocks + 1]
         if not self.no_masks:
@@ -423,6 +506,12 @@ class Discriminator(nn.Module):
             self.body_ll.append(cur_block)
             self.rgb_to_features.append(from_rgb(msg_channels, in_channels=3))
             self.final_ll.append(to_decision(num_of_channels[i+1], 1))
+        self.latent_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(num_of_channels[self.num_blocks_ll], self.texture_noise_dim),
+        )
+
         # --- D content --- #
         self.content_FA = Content_FA(self.no_masks, self.prob_FA["content"], self.num_mask_channels)
         for i in range(self.num_blocks_ll, self.num_blocks):
@@ -491,10 +580,12 @@ class Discriminator(nn.Module):
             y_lay = self.body_layout[k](y_lay)
             output_layout.append(self.final_layout[k](y_lay))
 
+        latent_prediction = self.latent_head(y)
         return {
             "low-level": output_ll,
             "content": output_content,
             "layout": output_layout,
+            "latent": latent_prediction,
         }
 
 

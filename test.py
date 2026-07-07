@@ -1,5 +1,3 @@
-import torch
-
 import config
 from core import dataloading, models, tracking, utils
 from core.online_anatomy import OnlineAnatomySampler
@@ -12,7 +10,6 @@ visualizer = tracking.visualizer(opt)
 anatomy_sampler = OnlineAnatomySampler(
     max_displacement_frac=opt.anatomy_max_displacement
 )
-num_regions = model_config["num_mask_channels"]
 
 data_iterator = iter(dataloader)
 for index in range(opt.num_generated):
@@ -20,26 +17,16 @@ for index in range(opt.num_generated):
     batch = utils.preprocess_real(
         batch, model_config["num_blocks_d0"], opt.device
     )
-    sampled = anatomy_sampler.sample(
-        batch["conditions"][:1], batch["masks"][:1], count=1
-    )
-    z_texture = torch.randn(
-        1,
-        num_regions,
-        opt.texture_noise_dim,
-        device=opt.device,
-    )
+    base_mask = batch["masks"][:1]
+    target_mask = anatomy_sampler.sample(base_mask, count=1)
+    z_global = utils.sample_noise(opt.global_noise_dim, 1).to(opt.device)
+    z_texture = utils.sample_noise(opt.texture_noise_dim, 1).to(opt.device)
     generator = netEMA if not opt.no_EMA else netG
-    style_codes = generator.encode_style(
-        batch["images"][-1][:1],
-        batch["masks"][:1],
-        output_count=1,
-        randomize_patches=True,
-    )
     fake = generator.generate(
+        z_global,
         z_texture,
-        conditions=sampled["conditions"],
-        masks=sampled["masks"],
-        style_codes=style_codes,
+        masks=target_mask,
+        style_images=batch["images"][-1][:1],
+        style_masks=base_mask,
     )
     visualizer.save_batch(fake, opt.continue_epoch, i=str(index))
