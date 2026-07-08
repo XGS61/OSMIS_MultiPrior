@@ -7,6 +7,10 @@ datasets/rendered_us_test2_online/
 datasets/rendered_us_test2_fullsean/
 datasets/rendered_us_test2_hierspade_quick/
 datasets/rendered_us_test2_mask_variants/
+datasets/pelvic_*_hierspade/
+datasets/pelvic_*_multilevel_draft/
+datasets/pelvic_*_source/random_mask_preview.png
+metrics/compare_*_hierspade.json
 **__pycache__/
 __pycache__/
 .idea/

@@ -87,9 +87,14 @@ smooth displacement: 0.04 image fraction
 accepted area ratio: 0.68 .. 1.42
 centroid shift:      <= 0.10
 internal jitter:     +/- 3 degrees, 0.88 .. 1.12 scale
+support boundary:    weak transform only by default
 ```
 
 These values are meant for verification, not final clinical validation.
+For hierarchical masks, the rendered ultrasound support boundary is now sampled
+with a separate weak transform so that the outer rendered volume remains mostly
+stable while the levator-hiatus target and internal candidates keep larger
+variation.
 
 ## RTX 5090 quick run
 
@@ -163,3 +168,44 @@ structure objective or soft internal prior should be tested next.
 
 See [UPSTREAM.md](UPSTREAM.md), [LICENSE](LICENSE), and
 [3rd-party-licenses.txt](3rd-party-licenses.txt).
+
+## Pelvic test6/test7 sequential training
+
+The repository includes source images for two additional cases:
+
+```text
+datasets/pelvic_test6_source/image/00000.jpg
+datasets/pelvic_test7_source/image/00000.jpg
+```
+
+Before training, add one binary target mask for each case:
+
+```text
+datasets/pelvic_test6_source/mask/00000.png
+datasets/pelvic_test7_source/mask/00000.png
+```
+
+The binary mask should be black/white, with white = levator-hiatus segmentation
+target.  The script derives the rendered support and 0..5 multi-class anatomy
+condition automatically.
+
+Train test6 and test7 sequentially:
+
+```bash
+bash run_pelvic_test6_test7_5090.sh
+```
+
+Useful overrides:
+
+```bash
+NUM_EPOCHS=150000 SAVE_FREQ=1000 bash run_pelvic_test6_test7_5090.sh
+CASES="test6" NUM_EPOCHS=100000 bash run_pelvic_test6_test7_5090.sh
+CONTINUE=1 NUM_EPOCHS=200000 bash run_pelvic_test6_test7_5090.sh
+```
+
+Generate after training:
+
+```bash
+bash generate_pelvic_case_5090.sh test6 100000
+bash generate_pelvic_case_5090.sh test7 100000
+```

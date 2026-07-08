@@ -21,6 +21,11 @@ class OnlineAnatomySampler:
         max_translation_frac=0.045,
         scale_x=(0.84, 1.16),
         scale_y=(0.88, 1.12),
+        support_max_displacement_frac=0.010,
+        support_max_rotation_deg=1.5,
+        support_max_translation_frac=0.010,
+        support_scale_x=(0.97, 1.03),
+        support_scale_y=(0.98, 1.02),
         max_attempts=18,
     ):
         self.max_displacement_frac = max_displacement_frac
@@ -28,29 +33,46 @@ class OnlineAnatomySampler:
         self.max_translation_frac = max_translation_frac
         self.scale_x = scale_x
         self.scale_y = scale_y
+        self.support_max_displacement_frac = support_max_displacement_frac
+        self.support_max_rotation_rad = math.radians(support_max_rotation_deg)
+        self.support_max_translation_frac = support_max_translation_frac
+        self.support_scale_x = support_scale_x
+        self.support_scale_y = support_scale_y
         self.max_attempts = max_attempts
 
     @staticmethod
     def _uniform(count, low, high, device, dtype):
         return low + torch.rand(count, device=device, dtype=dtype) * (high - low)
 
-    def _global_grid(self, count, height, width, device, dtype):
+    def _make_grid(
+        self,
+        count,
+        height,
+        width,
+        device,
+        dtype,
+        max_rotation_rad,
+        max_translation_frac,
+        scale_x,
+        scale_y,
+        max_displacement_frac,
+    ):
         angle = self._uniform(
-            count, -self.max_rotation_rad, self.max_rotation_rad, device, dtype
+            count, -max_rotation_rad, max_rotation_rad, device, dtype
         )
-        sx = self._uniform(count, self.scale_x[0], self.scale_x[1], device, dtype)
-        sy = self._uniform(count, self.scale_y[0], self.scale_y[1], device, dtype)
+        sx = self._uniform(count, scale_x[0], scale_x[1], device, dtype)
+        sy = self._uniform(count, scale_y[0], scale_y[1], device, dtype)
         tx = self._uniform(
             count,
-            -2.0 * self.max_translation_frac,
-            2.0 * self.max_translation_frac,
+            -2.0 * max_translation_frac,
+            2.0 * max_translation_frac,
             device,
             dtype,
         )
         ty = self._uniform(
             count,
-            -2.0 * self.max_translation_frac,
-            2.0 * self.max_translation_frac,
+            -2.0 * max_translation_frac,
+            2.0 * max_translation_frac,
             device,
             dtype,
         )
@@ -76,7 +98,7 @@ class OnlineAnatomySampler:
             coarse, size=(height, width), mode="bicubic", align_corners=False
         )
         displacement = torch.tanh(displacement)
-        pixel_scale_x = 2.0 * self.max_displacement_frac
+        pixel_scale_x = 2.0 * max_displacement_frac
         pixel_scale_y = pixel_scale_x * (width / max(height, 1)) * 0.65
         grid = grid + torch.stack(
             (
@@ -86,6 +108,34 @@ class OnlineAnatomySampler:
             dim=-1,
         )
         return grid
+
+    def _global_grid(self, count, height, width, device, dtype):
+        return self._make_grid(
+            count,
+            height,
+            width,
+            device,
+            dtype,
+            self.max_rotation_rad,
+            self.max_translation_frac,
+            self.scale_x,
+            self.scale_y,
+            self.max_displacement_frac,
+        )
+
+    def _support_grid(self, count, height, width, device, dtype):
+        return self._make_grid(
+            count,
+            height,
+            width,
+            device,
+            dtype,
+            self.support_max_rotation_rad,
+            self.support_max_translation_frac,
+            self.support_scale_x,
+            self.support_scale_y,
+            self.support_max_displacement_frac,
+        )
 
     @staticmethod
     def _hard_one_hot(probabilities):
@@ -173,7 +223,7 @@ class OnlineAnatomySampler:
             occupied = torch.clamp(occupied + moved, 0, 1)
         return torch.cat(moved_channels, dim=1)
 
-    def _rebuild_hierarchical(self, candidate):
+    def _rebuild_hierarchical(self, candidate, support_override=None):
         """Rebuild 0/1/2/3/4/5 regions after a global deformation.
 
         Input convention:
@@ -184,7 +234,12 @@ class OnlineAnatomySampler:
         Output preserves the same exclusive layout.  Internal candidate classes
         get a small relative jitter, but remain inside the target union.
         """
-        support = candidate[:, 1:].sum(dim=1, keepdim=True).clamp(0, 1)
+        support = (
+            support_override
+            if support_override is not None
+            else candidate[:, 1:].sum(dim=1, keepdim=True).clamp(0, 1)
+        )
+        support = support.clamp(0, 1)
         target = candidate[:, 2:].sum(dim=1, keepdim=True).clamp(0, 1) * support
         internals = self._jitter_hierarchical_internal_labels(
             candidate[:, 3:], target
@@ -233,6 +288,21 @@ class OnlineAnatomySampler:
         # jumps that would move the annotated anatomy out of the rendered
         # support or destroy the target topology.
         valid = (area_ratio >= 0.68) & (area_ratio <= 1.42) & (shift <= 0.10)
+        if candidate.shape[1] > 2:
+            support = candidate[:, 1:].sum(dim=1, keepdim=True).clamp(0, 1)
+            ref_support = reference[:, 1:].sum(dim=1, keepdim=True).clamp(0, 1)
+            support_area_ratio = support.sum((1, 2, 3)) / ref_support.sum(
+                (1, 2, 3)
+            ).clamp_min(1.0)
+            support_cx, support_cy = centroid(support)
+            ref_support_cx, ref_support_cy = centroid(ref_support)
+            support_shift = torch.sqrt(
+                (support_cx - ref_support_cx) ** 2
+                + (support_cy - ref_support_cy) ** 2
+            )
+            valid = valid & (support_area_ratio >= 0.90)
+            valid = valid & (support_area_ratio <= 1.12)
+            valid = valid & (support_shift <= 0.045)
         if candidate.shape[1] > 3:
             internals = candidate[:, 3:]
             ref_internals = reference[:, 3:]
@@ -255,7 +325,7 @@ class OnlineAnatomySampler:
         while remaining > 0 and attempts < self.max_attempts:
             attempts += 1
             source = base_masks[:1].repeat(remaining, 1, 1, 1)
-            grid = self._global_grid(
+            anatomy_grid = self._global_grid(
                 remaining,
                 height,
                 width,
@@ -264,14 +334,32 @@ class OnlineAnatomySampler:
             )
             warped = F.grid_sample(
                 source,
-                grid,
+                anatomy_grid,
                 mode="bilinear",
                 padding_mode="zeros",
                 align_corners=False,
             )
             candidate = self._hard_one_hot(warped)
             if candidate.shape[1] > 2:
-                candidate = self._rebuild_hierarchical(candidate)
+                support_source = source[:, 1:].sum(dim=1, keepdim=True).clamp(0, 1)
+                support_grid = self._support_grid(
+                    remaining,
+                    height,
+                    width,
+                    source.device,
+                    source.dtype,
+                )
+                weak_support = F.grid_sample(
+                    support_source,
+                    support_grid,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                )
+                weak_support = (weak_support >= 0.5).to(source.dtype)
+                candidate = self._rebuild_hierarchical(
+                    candidate, support_override=weak_support
+                )
             else:
                 candidate = self._jitter_internal_labels(candidate)
             valid = self._valid(candidate, reference[:remaining])

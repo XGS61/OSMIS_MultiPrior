@@ -1,4 +1,4 @@
-"""Create a review-only hierarchical annotation draft for the test2 case.
+"""Create a review-only hierarchical annotation draft for one pelvic case.
 
 This utility preserves the supplied levator-hiatus annotation and derives:
 1) the rendered ultrasound support;
@@ -86,6 +86,34 @@ def dark_candidate(gray, target, box, percentile, expected_center):
     return candidate & target
 
 
+def fallback_candidate(target, expected_center, radius=(0.055, 0.035), occupied=None):
+    """Small geometry prior used only when dark-component detection fails."""
+    if occupied is None:
+        occupied = np.zeros_like(target, dtype=bool)
+    valid = target & ~occupied
+    if not valid.any():
+        return np.zeros_like(target, dtype=bool)
+    height, width = target.shape
+    ys, xs = np.where(valid)
+    expected_x = expected_center[0] * width
+    expected_y = expected_center[1] * height
+    nearest = np.argmin((xs - expected_x) ** 2 + (ys - expected_y) ** 2)
+    cx, cy = xs[nearest], ys[nearest]
+    yy, xx = np.ogrid[:height, :width]
+    rx = max(4.0, radius[0] * width)
+    ry = max(4.0, radius[1] * height)
+    candidate = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 <= 1.0
+    candidate = ndi.binary_closing(candidate & valid, iterations=2)
+    candidate = ndi.binary_fill_holes(candidate)
+    return candidate & valid
+
+
+def ensure_candidate(candidate, target, expected_center, occupied=None):
+    if candidate.sum() >= 20:
+        return candidate
+    return fallback_candidate(target, expected_center, occupied=occupied)
+
+
 def save_binary(path, mask):
     Image.fromarray((mask.astype(np.uint8) * 255)).save(path)
 
@@ -112,14 +140,20 @@ def main():
     anterior = dark_candidate(
         gray, target, (0.38, 0.23, 0.58, 0.39), 28, (0.49, 0.31)
     )
+    anterior = ensure_candidate(anterior, target, (0.49, 0.31))
     middle = dark_candidate(
         gray, target, (0.34, 0.50, 0.58, 0.68), 24, (0.45, 0.59)
     )
+    middle = ensure_candidate(middle, target, (0.45, 0.59), anterior)
     posterior = dark_candidate(
         gray, target, (0.42, 0.64, 0.60, 0.78), 18, (0.53, 0.70)
     )
     middle &= ~anterior
+    middle = ensure_candidate(middle, target, (0.45, 0.59), anterior)
     posterior &= ~(anterior | middle)
+    posterior = ensure_candidate(
+        posterior, target, (0.53, 0.70), anterior | middle
+    )
 
     indexed = np.zeros(target.shape, dtype=np.uint8)
     indexed[support] = 1

@@ -8,7 +8,10 @@ dataloader, model_config = dataloading.prepare_dataloading(opt)
 netG, netD, netEMA = models.create_models(opt, model_config)
 visualizer = tracking.visualizer(opt)
 anatomy_sampler = OnlineAnatomySampler(
-    max_displacement_frac=opt.anatomy_max_displacement
+    max_displacement_frac=opt.anatomy_max_displacement,
+    support_max_displacement_frac=opt.support_max_displacement,
+    support_max_rotation_deg=opt.support_max_rotation,
+    support_max_translation_frac=opt.support_max_translation,
 )
 
 data_iterator = iter(dataloader)

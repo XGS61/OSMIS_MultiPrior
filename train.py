@@ -17,7 +17,10 @@ timer = utils.timer(opt)
 visualizer = tracking.visualizer(opt)
 diff_augment = diff_augm.augment_pipe(opt)
 anatomy_sampler = OnlineAnatomySampler(
-    max_displacement_frac=opt.anatomy_max_displacement
+    max_displacement_frac=opt.anatomy_max_displacement,
+    support_max_displacement_frac=opt.support_max_displacement,
+    support_max_rotation_deg=opt.support_max_rotation,
+    support_max_translation_frac=opt.support_max_translation,
 )
 print("Using fresh online anatomy conditions; no fixed mask bank is loaded.")
 

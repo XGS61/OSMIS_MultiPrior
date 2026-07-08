@@ -72,6 +72,12 @@ def get_arguments():
     parser.add_argument('--anchor_final_ratio', type=float, default=0.10)
     parser.add_argument('--anatomy_max_displacement', type=float, default=0.04,
                         help='online smooth mask displacement as image fraction')
+    parser.add_argument('--support_max_displacement', type=float, default=0.010,
+                        help='weaker smooth displacement for rendered support boundary')
+    parser.add_argument('--support_max_rotation', type=float, default=1.5,
+                        help='maximum rendered support boundary rotation in degrees')
+    parser.add_argument('--support_max_translation', type=float, default=0.010,
+                        help='maximum rendered support boundary translation as image fraction')
     parser.add_argument('--init_from_31000_dir', default="",
                         help='optional 31000 online-minimal models/ directory for partial HierSPADE initialization')
     parser.add_argument('--prob_FA_con', type=float, help='probability of content FA', default=0.4)

@@ -17,6 +17,10 @@ NUM_EPOCHS="${NUM_EPOCHS:-5000}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 INIT_FROM_31000_DIR="${INIT_FROM_31000_DIR:-checkpoints/test2_online_minimal_31000_imported/models}"
+ANATOMY_MAX_DISPLACEMENT="${ANATOMY_MAX_DISPLACEMENT:-0.04}"
+SUPPORT_MAX_DISPLACEMENT="${SUPPORT_MAX_DISPLACEMENT:-0.010}"
+SUPPORT_MAX_ROTATION="${SUPPORT_MAX_ROTATION:-1.5}"
+SUPPORT_MAX_TRANSLATION="${SUPPORT_MAX_TRANSLATION:-0.010}"
 
 python -u prepare_online_case.py \
   --image "${IMAGE_PATH}" \
@@ -57,7 +61,10 @@ python -u train.py \
   --anchor_decay_start 5000 \
   --anchor_decay_end 20000 \
   --anchor_final_ratio 0.10 \
-  --anatomy_max_displacement 0.04 \
+  --anatomy_max_displacement "${ANATOMY_MAX_DISPLACEMENT}" \
+  --support_max_displacement "${SUPPORT_MAX_DISPLACEMENT}" \
+  --support_max_rotation "${SUPPORT_MAX_ROTATION}" \
+  --support_max_translation "${SUPPORT_MAX_TRANSLATION}" \
   --style_dim 32 \
   --freq_print 500 \
   --freq_save_loss 500 \
